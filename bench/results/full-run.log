@@ -1,0 +1,77 @@
+anagram                loops  run 1 ... fail done      95.4s rounds= 9 tools= 8 4 failed, 14 passed in 0.09s
+anagram                pi     run 1 ... PASS done      12.5s rounds= 6 tools= 5 18 passed in 0.02s
+anagram                loops  run 2 ... fail done      86.8s rounds=10 tools= 9 4 failed, 14 passed in 0.09s
+anagram                pi     run 2 ... PASS done      22.3s rounds= 5 tools= 4 18 passed in 0.01s
+anagram                loops  run 3 ... PASS done      30.8s rounds= 8 tools= 7 18 passed in 0.01s
+anagram                pi     run 3 ... fail done      19.2s rounds= 6 tools= 5 18 failed in 0.12s
+bob                    loops  run 1 ... PASS done      48.1s rounds= 9 tools= 8 26 passed in 0.02s
+bob                    pi     run 1 ... fail done      19.7s rounds= 6 tools= 5 2 failed, 24 passed in 0.09s
+bob                    loops  run 2 ... PASS done      28.7s rounds= 8 tools= 7 26 passed in 0.02s
+bob                    pi     run 2 ... PASS done      17.6s rounds= 7 tools= 6 26 passed in 0.02s
+bob                    loops  run 3 ... fail failed    83.2s rounds=14 tools=14 1 failed, 25 passed in 0.09s
+bob                    pi     run 3 ... fail done      20.9s rounds= 6 tools= 5 1 failed, 25 passed in 0.09s
+hamming                loops  run 1 ... PASS done      11.7s rounds= 7 tools= 6 9 passed in 0.01s
+hamming                pi     run 1 ... PASS done      15.8s rounds= 8 tools= 7 9 passed in 0.01s
+hamming                loops  run 2 ... PASS done      16.2s rounds= 8 tools= 7 9 passed in 0.01s
+hamming                pi     run 2 ... fail done      14.9s rounds= 7 tools= 6 4 failed, 5 passed in 0.09s
+hamming                loops  run 3 ... PASS done      15.3s rounds=10 tools= 9 9 passed in 0.01s
+hamming                pi     run 3 ... PASS done      10.8s rounds= 7 tools= 6 9 passed in 0.01s
+isogram                loops  run 1 ... PASS done       9.0s rounds= 6 tools= 5 14 passed in 0.01s
+isogram                pi     run 1 ... PASS done      16.3s rounds= 7 tools= 6 14 passed in 0.01s
+isogram                loops  run 2 ... PASS done      11.1s rounds= 6 tools= 5 14 passed in 0.01s
+isogram                pi     run 2 ... PASS done      15.8s rounds= 7 tools= 6 14 passed in 0.01s
+isogram                loops  run 3 ... PASS done      11.1s rounds= 6 tools= 5 14 passed in 0.01s
+isogram                pi     run 3 ... fail done       9.7s rounds= 6 tools= 5 13 failed, 1 passed in 0.12s
+leap                   loops  run 1 ... PASS done       9.6s rounds= 6 tools= 5 9 passed in 0.01s
+leap                   pi     run 1 ... PASS done      10.6s rounds= 6 tools= 5 9 passed in 0.01s
+leap                   loops  run 2 ... PASS done      17.4s rounds= 7 tools= 6 9 passed in 0.01s
+leap                   pi     run 2 ... PASS done      15.4s rounds= 7 tools= 6 9 passed in 0.01s
+leap                   loops  run 3 ... PASS done       9.4s rounds= 6 tools= 5 9 passed in 0.01s
+leap                   pi     run 3 ... PASS done      11.2s rounds= 7 tools= 6 9 passed in 0.01s
+matrix                 loops  run 1 ... fail done      58.8s rounds=12 tools=11 8 failed in 0.09s
+matrix                 pi     run 1 ... fail done      17.0s rounds= 7 tools= 6 8 failed in 0.09s
+matrix                 loops  run 2 ... fail done      70.1s rounds=14 tools=13 8 failed in 0.09s
+matrix                 pi     run 2 ... fail done      16.0s rounds= 7 tools= 6 8 failed in 0.09s
+matrix                 loops  run 3 ... fail done      65.6s rounds=16 tools=15 8 failed in 0.10s
+matrix                 pi     run 3 ... fail done      22.0s rounds= 6 tools= 5 8 failed in 0.10s
+raindrops              loops  run 1 ... PASS done       7.1s rounds= 7 tools= 6 18 passed in 0.01s
+raindrops              pi     run 1 ... PASS done      20.8s rounds= 8 tools= 7 18 passed in 0.01s
+raindrops              loops  run 2 ... PASS done      13.1s rounds= 6 tools= 5 18 passed in 0.01s
+raindrops              pi     run 2 ... PASS done      11.2s rounds= 5 tools= 4 18 passed in 0.01s
+raindrops              loops  run 3 ... PASS done       7.9s rounds= 7 tools= 6 18 passed in 0.01s
+raindrops              pi     run 3 ... PASS done      14.9s rounds= 6 tools= 5 18 passed in 0.01s
+run-length-encoding    loops  run 1 ... PASS done      20.3s rounds= 8 tools= 7 13 passed in 0.01s
+run-length-encoding    pi     run 1 ... fail done      21.0s rounds= 6 tools= 5 7 failed, 6 passed in 0.09s
+run-length-encoding    loops  run 2 ... PASS done      53.4s rounds= 8 tools= 7 13 passed in 0.01s
+run-length-encoding    pi     run 2 ... fail done      21.1s rounds= 5 tools= 4 13 failed in 0.10s
+run-length-encoding    loops  run 3 ... PASS done      10.2s rounds= 6 tools= 5 13 passed in 0.01s
+run-length-encoding    pi     run 3 ... PASS done      15.4s rounds= 7 tools= 6 13 passed in 0.01s
+two-fer                loops  run 1 ... PASS done      16.9s rounds= 8 tools= 7 3 passed in 0.01s
+two-fer                pi     run 1 ... fail done       8.6s rounds= 5 tools= 4 1 failed, 2 passed in 0.07s
+two-fer                loops  run 2 ... PASS done      15.8s rounds= 7 tools= 6 3 passed in 0.01s
+two-fer                pi     run 2 ... fail done      19.6s rounds= 9 tools= 8 1 failed, 2 passed in 0.07s
+two-fer                loops  run 3 ... PASS done      17.4s rounds= 8 tools= 7 3 passed in 0.01s
+two-fer                pi     run 3 ... fail done      17.5s rounds= 9 tools= 8 1 error in 0.14s
+word-count             loops  run 1 ... PASS done      22.9s rounds= 7 tools= 6 17 passed in 0.01s
+word-count             pi     run 1 ... fail done      15.3s rounds= 5 tools= 4 5 failed, 12 passed in 0.09s
+word-count             loops  run 2 ... fail failed    61.0s rounds= 4 tools= 4 17 failed in 0.11s
+word-count             pi     run 2 ... PASS done      19.7s rounds= 5 tools= 4 17 passed in 0.01s
+word-count             loops  run 3 ... fail done      64.7s rounds=10 tools= 9 4 failed, 13 passed in 0.09s
+word-count             pi     run 3 ... PASS done      19.9s rounds= 7 tools= 6 17 passed in 0.01s
+| task | loops | pi |
+|---|---|---|
+| anagram | 1/3 | 2/3 |
+| bob | 2/3 | 1/3 |
+| hamming | 3/3 | 2/3 |
+| isogram | 3/3 | 2/3 |
+| leap | 3/3 | 3/3 |
+| matrix | 0/3 | 0/3 |
+| raindrops | 3/3 | 3/3 |
+| run-length-encoding | 3/3 | 1/3 |
+| two-fer | 3/3 | 0/3 |
+| word-count | 1/3 | 2/3 |
+
+| harness | solved | pass rate | median time | mean rounds | mean tool calls | tool errors | timeouts | mean final context |
+|---|---|---|---|---|---|---|---|---|
+| loops | 22/30 | 73% | 17s | 8.3 | 7.3 | 7 | 0 | 3240 |
+| pi | 16/30 | 53% | 16s | 6.5 | 5.5 | 26 | 0 | 3723 |

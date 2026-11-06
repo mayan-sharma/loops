@@ -16,11 +16,15 @@
 //! [`App::update`], then redraws. Model work (startup, `/model` listing and
 //! loading, agent turns) is just more senders on the same channel, so the
 //! loop itself does not change. A turn sends one event per agent event.
+//!
+//! With `--print` none of this runs: [`print`] does one headless turn and
+//! exits, and the terminal is never put in raw mode.
 
 mod app;
+mod print;
 mod ui;
 
-use std::{sync::Arc, time::Duration};
+use std::{process::ExitCode, sync::Arc, time::Duration};
 
 use anyhow::{Result, anyhow};
 use crossterm::event::{Event, EventStream};
@@ -41,14 +45,40 @@ use app::{App, AppEvent, ModelEvent};
 const TICK: Duration = Duration::from_millis(250);
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<ExitCode> {
+    // Arguments first: only the TUI may touch the terminal's mode.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match print::parse(&args) {
+        Ok(print::Command::Tui) => {}
+        Ok(print::Command::Help) => {
+            print!("{}", print::USAGE);
+            return Ok(ExitCode::SUCCESS);
+        }
+        Ok(print::Command::Print(args)) => {
+            let code = print::run(args).await.unwrap_or_else(|err| {
+                eprintln!("error: {err:#}");
+                2
+            });
+            return Ok(ExitCode::from(code));
+        }
+        Err(err) => {
+            eprintln!(
+                "error: {err:#}
+
+{}",
+                print::USAGE
+            );
+            return Ok(ExitCode::from(2));
+        }
+    }
+
     // `init` enables raw mode, enters the alternate screen, and installs a
     // panic hook that restores the terminal before the panic message prints.
     let terminal = ratatui::init();
     let result = run(terminal).await;
     // Restore on every exit path that is not a panic (quit or error).
     ratatui::restore();
-    result
+    result.map(|()| ExitCode::SUCCESS)
 }
 
 /// Runs the main loop until the app asks to quit.

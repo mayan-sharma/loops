@@ -1,0 +1,685 @@
+//! Headless mode: `loops --print "<prompt>"` runs one agent turn in the
+//! current directory and exits, for scripts and benchmark runners.
+//!
+//! There is nobody at a keyboard, so nothing here may wait on input: every
+//! permission request is allowed, and the whole turn runs under a wall-clock
+//! timeout. The streams are split so a caller can capture them separately:
+//! stdout carries only the model's final answer, stderr a live log with one
+//! line per agent event. The exit code says how it went (see [`USAGE`]), and
+//! `--stats` leaves a JSON summary behind for comparison across runs.
+//!
+//! The summary is folded from the turn's [`AgentEvent`]s by [`fold_stats`], a
+//! pure function, so it is tested without a model.
+
+use std::{
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use anyhow::{Context, Result, bail};
+use loops_core::{
+    Conversation, Message, Role,
+    agent::{Agent, AgentEvent, Decision, default_environment, default_system_prompt},
+    backend::ModelBackend,
+    lmstudio::{LmStudio, ModelState},
+    tools::ToolSet,
+};
+use serde_json::{Value, json};
+use tokio::sync::mpsc;
+
+/// What `--help` prints.
+pub const USAGE: &str = "\
+loops: a coding agent for models served by LM Studio.
+
+Usage:
+  loops                          start the interactive TUI
+  loops --print <prompt> [options]
+                                 run one agent turn in the current directory and exit
+
+Options (with --print):
+  -p, --print <prompt>     the user message; the final answer goes to stdout,
+                           a log of the turn to stderr
+      --max-rounds <n>     model requests allowed in the turn (default 20)
+      --timeout <seconds>  wall-clock limit for the turn (default 300)
+      --stats <path>       write a JSON summary of the run to <path>
+      --model <id>         model to use (default: the loaded one; loads <id>
+                           if it is not loaded)
+  -h, --help               print this help
+
+Every tool call is allowed without asking.
+Exit codes: 0 done, 1 turn failed or timed out, 2 setup error.
+";
+
+/// Rounds allowed when `--max-rounds` is not given.
+const DEFAULT_MAX_ROUNDS: usize = 20;
+/// Wall-clock limit when `--timeout` is not given.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
+/// Longest `bash` command shown in a log line; the rest is cut.
+const COMMAND_CHARS: usize = 100;
+
+/// What the command line asks for.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Command {
+    /// No arguments: the interactive TUI.
+    Tui,
+    /// `--print`: one headless turn.
+    Print(PrintArgs),
+    /// `--help`: print [`USAGE`].
+    Help,
+}
+
+/// Options of a headless run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrintArgs {
+    /// The user message.
+    pub prompt: String,
+    /// Model requests allowed in the turn ([`Agent::max_iterations`]).
+    pub max_rounds: usize,
+    /// Wall-clock limit for the turn.
+    pub timeout: Duration,
+    /// Where to write the JSON summary, if anywhere.
+    pub stats: Option<PathBuf>,
+    /// Model to use; `None` means whatever is loaded.
+    pub model: Option<String>,
+}
+
+/// Parses the arguments after the program name. Options other than `--help`
+/// need `--print`; anything unknown is an error, so a typo in a benchmark
+/// script fails loudly instead of opening the TUI.
+pub fn parse(args: &[String]) -> Result<Command> {
+    let mut prompt = None;
+    let mut max_rounds = DEFAULT_MAX_ROUNDS;
+    let mut timeout = DEFAULT_TIMEOUT;
+    let mut stats = None;
+    let mut model = None;
+    // The first `--print` option seen, for the error if `--print` is missing.
+    let mut option = None;
+
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let mut value = || {
+            args.next()
+                .with_context(|| format!("{arg} needs a value"))
+                .map(String::as_str)
+        };
+        match arg.as_str() {
+            "-h" | "--help" => return Ok(Command::Help),
+            "-p" | "--print" => prompt = Some(value()?.to_owned()),
+            "--max-rounds" => max_rounds = positive(arg, value()?)?,
+            "--timeout" => timeout = Duration::from_secs(positive(arg, value()?)?),
+            "--stats" => stats = Some(PathBuf::from(value()?)),
+            "--model" => model = Some(value()?.to_owned()),
+            other => bail!("unknown argument: {other}"),
+        }
+        if !matches!(arg.as_str(), "-p" | "--print") {
+            option.get_or_insert(arg);
+        }
+    }
+
+    let Some(prompt) = prompt else {
+        if let Some(option) = option {
+            bail!("{option} needs --print");
+        }
+        return Ok(Command::Tui);
+    };
+    if prompt.trim().is_empty() {
+        bail!("--print needs a non-empty prompt");
+    }
+    Ok(Command::Print(PrintArgs {
+        prompt,
+        max_rounds,
+        timeout,
+        stats,
+        model,
+    }))
+}
+
+/// `value` as a whole number above zero, for option `name`.
+fn positive<T: std::str::FromStr + Default + PartialOrd>(name: &str, value: &str) -> Result<T> {
+    match value.parse::<T>() {
+        Ok(n) if n > T::default() => Ok(n),
+        _ => bail!("{name} needs a whole number above 0, got {value:?}"),
+    }
+}
+
+/// How a run ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// The model answered in text.
+    Done,
+    /// The turn stopped with an error (including running out of rounds).
+    Failed,
+    /// The wall-clock limit ran out and the turn was aborted.
+    Timeout,
+}
+
+impl Outcome {
+    /// The name used in the stats file.
+    fn as_str(self) -> &'static str {
+        match self {
+            Outcome::Done => "done",
+            Outcome::Failed => "failed",
+            Outcome::Timeout => "timeout",
+        }
+    }
+}
+
+/// One finished tool call, for the stats file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCallStat {
+    /// The tool's name.
+    pub name: String,
+    /// Its one-line result summary.
+    pub summary: String,
+    /// Whether it failed (or was declined).
+    pub is_error: bool,
+}
+
+/// The summary of a run that `--stats` writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stats {
+    /// How the run ended.
+    pub outcome: Outcome,
+    /// Why it failed or timed out.
+    pub error: Option<String>,
+    /// The model that ran the turn.
+    pub model: String,
+    /// Model requests made: one `Usage` event per request.
+    pub rounds: usize,
+    /// Finished tool calls, in order. A call cut off by the timeout is not here.
+    pub tool_calls: Vec<ToolCallStat>,
+    /// Prompt tokens of the last request: how full the context was at the end.
+    pub prompt_tokens_last: u64,
+    /// Completion tokens summed over all requests.
+    pub completion_tokens_total: u64,
+    /// Prompt tokens summed over all requests (what was actually processed,
+    /// before any prompt caching).
+    pub prompt_tokens_total: u64,
+    /// Wall-clock time of the turn.
+    pub elapsed: Duration,
+    /// The model's final text: what it said after its last tool call.
+    pub answer: String,
+}
+
+impl Stats {
+    /// The stats file's JSON.
+    pub fn to_json(&self) -> Value {
+        let tool_calls: Vec<Value> = self
+            .tool_calls
+            .iter()
+            .map(|call| {
+                json!({
+                    "name": call.name,
+                    "summary": call.summary,
+                    "is_error": call.is_error,
+                })
+            })
+            .collect();
+        json!({
+            "outcome": self.outcome.as_str(),
+            "error": self.error,
+            "model": self.model,
+            "rounds": self.rounds,
+            "tool_calls": tool_calls,
+            "prompt_tokens_last": self.prompt_tokens_last,
+            "completion_tokens_total": self.completion_tokens_total,
+            "prompt_tokens_total": self.prompt_tokens_total,
+            "elapsed_ms": u64::try_from(self.elapsed.as_millis()).unwrap_or(u64::MAX),
+            "answer": self.answer,
+        })
+    }
+}
+
+/// Folds a turn's events into its stats. `model` is left empty for the
+/// caller to fill in. A turn with no `TurnDone` or `TurnFailed` (its task
+/// ended without one) counts as failed; the caller marks a timeout itself.
+///
+/// The answer is the text that came after the last tool event: within a
+/// round all text arrives before its tools start, so text followed by tool
+/// calls was narration, not the answer.
+pub fn fold_stats(events: &[AgentEvent], elapsed: Duration) -> Stats {
+    let mut stats = Stats {
+        outcome: Outcome::Failed,
+        error: Some("the turn ended without a result".to_owned()),
+        model: String::new(),
+        rounds: 0,
+        tool_calls: Vec::new(),
+        prompt_tokens_last: 0,
+        completion_tokens_total: 0,
+        prompt_tokens_total: 0,
+        elapsed,
+        answer: String::new(),
+    };
+    for event in events {
+        match event {
+            AgentEvent::Text(text) => stats.answer.push_str(text),
+            AgentEvent::ToolStarted { .. } | AgentEvent::PermissionRequested { .. } => {
+                stats.answer.clear();
+            }
+            AgentEvent::ToolFinished {
+                name,
+                summary,
+                is_error,
+                ..
+            } => {
+                stats.answer.clear();
+                stats.tool_calls.push(ToolCallStat {
+                    name: name.clone(),
+                    summary: summary.clone(),
+                    is_error: *is_error,
+                });
+            }
+            AgentEvent::Usage {
+                prompt_tokens,
+                completion_tokens,
+            } => {
+                stats.rounds += 1;
+                stats.prompt_tokens_last = *prompt_tokens;
+                stats.prompt_tokens_total += prompt_tokens;
+                stats.completion_tokens_total += completion_tokens;
+            }
+            AgentEvent::Thinking => {}
+            AgentEvent::TurnDone => {
+                stats.outcome = Outcome::Done;
+                stats.error = None;
+            }
+            AgentEvent::TurnFailed(err) => {
+                stats.outcome = Outcome::Failed;
+                stats.error = Some(err.clone());
+            }
+        }
+    }
+    stats
+}
+
+/// Runs one headless turn and returns the process exit code: 0 done, 1 failed
+/// or timed out, 2 setup error (reported on stderr here). An `Err` is a setup
+/// error too, such as a stats file that cannot be written.
+pub async fn run(args: PrintArgs) -> Result<u8> {
+    let backend: Arc<dyn ModelBackend> = Arc::new(LmStudio::default());
+    let model = match pick_model(backend.as_ref(), args.model.as_deref()).await {
+        Ok(model) => model,
+        Err(err) => {
+            eprintln!("error: {err:#}");
+            return Ok(2);
+        }
+    };
+
+    let cwd = std::env::current_dir()?;
+    let tools = Arc::new(ToolSet::standard(&cwd));
+    if !tools.has("bash") {
+        eprintln!("warning: bash not found; the bash tool is off");
+    }
+    let mut agent = Agent::new(backend, tools, Some(default_system_prompt()))
+        .with_environment(default_environment(&cwd));
+    agent.max_iterations = args.max_rounds;
+    eprintln!(
+        "loops: model {model}, up to {} rounds, timeout {}s, in {}",
+        args.max_rounds,
+        args.timeout.as_secs(),
+        cwd.display()
+    );
+
+    let mut conversation = Conversation::new();
+    conversation.push(Message::new(Role::User, args.prompt));
+    let (sink, mut events) = mpsc::channel(256);
+    let (decide, decisions) = mpsc::channel(16);
+    let turn_model = model.clone();
+    let start = Instant::now();
+    let turn = tokio::spawn(async move {
+        // The outcome arrives as `TurnDone` / `TurnFailed` on `sink`.
+        let _ = agent
+            .run_turn(&turn_model, &mut conversation, sink, decisions)
+            .await;
+    });
+
+    let deadline = tokio::time::sleep(args.timeout);
+    tokio::pin!(deadline);
+    let mut log = Vec::new();
+    let timed_out = loop {
+        tokio::select! {
+            event = events.recv() => {
+                // `None`: the turn task ended and dropped its sender.
+                let Some(event) = event else { break false };
+                if let Some(line) = log_line(&event) {
+                    eprintln!("[{:5.1}s] {line}", start.elapsed().as_secs_f64());
+                }
+                if matches!(event, AgentEvent::PermissionRequested { .. }) {
+                    // A benchmark has nobody to ask. The turn is waiting on
+                    // exactly this answer, so the channel has room.
+                    let _ = decide.send(Decision::Allow).await;
+                }
+                log.push(event);
+            }
+            () = &mut deadline => {
+                // Dropping the turn's future kills a running `bash` child.
+                turn.abort();
+                break true;
+            }
+        }
+    };
+    let elapsed = start.elapsed();
+
+    let mut stats = fold_stats(&log, elapsed);
+    stats.model = model;
+    if timed_out {
+        stats.outcome = Outcome::Timeout;
+        stats.error = Some(format!("timed out after {}s", args.timeout.as_secs()));
+        eprintln!(
+            "[{:5.1}s] timed out after {}s",
+            elapsed.as_secs_f64(),
+            args.timeout.as_secs()
+        );
+    } else if !log
+        .iter()
+        .any(|e| matches!(e, AgentEvent::TurnDone | AgentEvent::TurnFailed(_)))
+    {
+        eprintln!(
+            "[{:5.1}s] the turn ended without a result",
+            elapsed.as_secs_f64()
+        );
+    }
+
+    if stats.outcome == Outcome::Done {
+        println!("{}", stats.answer.trim_end());
+    }
+    if let Some(path) = &args.stats {
+        let text = serde_json::to_string_pretty(&stats.to_json())?;
+        std::fs::write(path, text + "\n")
+            .with_context(|| format!("could not write stats to {}", path.display()))?;
+    }
+    Ok(if stats.outcome == Outcome::Done { 0 } else { 1 })
+}
+
+/// Starts the backend and settles on a model: `wanted` if given (loading it
+/// when it is not loaded yet), else the loaded one.
+async fn pick_model(backend: &dyn ModelBackend, wanted: Option<&str>) -> Result<String> {
+    let loaded = backend.start().await.context("could not start LM Studio")?;
+    let Some(wanted) = wanted else {
+        return match loaded {
+            Some(model) => Ok(model.id),
+            None => bail!("no model loaded (load one in LM Studio or pass --model <id>)"),
+        };
+    };
+    // `start` reports only the first loaded model; another may be loaded too.
+    let already = backend
+        .list_models()
+        .await?
+        .iter()
+        .any(|m| m.id == wanted && m.state == ModelState::Loaded);
+    if !already {
+        eprintln!("loops: loading {wanted}");
+        backend
+            .load_model(wanted)
+            .await
+            .with_context(|| format!("could not load {wanted}"))?;
+    }
+    Ok(wanted.to_owned())
+}
+
+/// The log line for `event`, without its time prefix; `None` for events too
+/// small to log one by one (streamed text).
+fn log_line(event: &AgentEvent) -> Option<String> {
+    let line = match event {
+        AgentEvent::Text(_) => return None,
+        AgentEvent::Thinking => "thinking".to_owned(),
+        AgentEvent::ToolStarted {
+            name, arguments, ..
+        } => format!("tool {name}: {}", call_label(arguments)),
+        AgentEvent::PermissionRequested { scope, .. } => format!("allowed {scope}"),
+        AgentEvent::ToolFinished {
+            name,
+            summary,
+            is_error,
+            ..
+        } => {
+            let first = summary.lines().next().unwrap_or_default();
+            let verb = if *is_error { "error" } else { "done" };
+            format!("{verb} {name}: {first}")
+        }
+        AgentEvent::Usage {
+            prompt_tokens,
+            completion_tokens,
+        } => format!("usage {prompt_tokens}+{completion_tokens}"),
+        AgentEvent::TurnDone => "turn done".to_owned(),
+        AgentEvent::TurnFailed(err) => format!("turn failed: {err}"),
+    };
+    Some(line)
+}
+
+/// A call's arguments on one line: `$ <command>` for `bash` (first line, cut
+/// after [`COMMAND_CHARS`] characters), the `path` for file tools, else the
+/// raw JSON.
+fn call_label(arguments: &str) -> String {
+    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(arguments) else {
+        return arguments.to_owned();
+    };
+    match (map.get("command"), map.get("path")) {
+        (Some(Value::String(command)), _) => {
+            let first = command.lines().next().unwrap_or_default();
+            let mut shown: String = first.chars().take(COMMAND_CHARS).collect();
+            if shown != command.trim_end() {
+                shown.push_str(" …");
+            }
+            format!("$ {shown}")
+        }
+        (_, Some(Value::String(path))) => path.clone(),
+        _ => arguments.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_strs(args: &[&str]) -> Result<Command> {
+        let args: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
+        parse(&args)
+    }
+
+    fn print_args(args: &[&str]) -> PrintArgs {
+        match parse_strs(args).unwrap() {
+            Command::Print(args) => args,
+            other => panic!("expected Print, got {other:?}"),
+        }
+    }
+
+    fn parse_error(args: &[&str]) -> String {
+        format!("{:#}", parse_strs(args).unwrap_err())
+    }
+
+    #[test]
+    fn no_arguments_run_the_tui() {
+        assert_eq!(parse_strs(&[]).unwrap(), Command::Tui);
+    }
+
+    #[test]
+    fn print_alone_uses_the_defaults() {
+        let args = print_args(&["--print", "fix it"]);
+        assert_eq!(
+            args,
+            PrintArgs {
+                prompt: "fix it".into(),
+                max_rounds: 20,
+                timeout: Duration::from_secs(300),
+                stats: None,
+                model: None,
+            }
+        );
+        assert_eq!(print_args(&["-p", "fix it"]), args);
+    }
+
+    #[test]
+    fn every_option_is_read_in_any_order() {
+        let args = print_args(&[
+            "--stats",
+            "out/stats.json",
+            "--max-rounds",
+            "5",
+            "-p",
+            "fix the typo",
+            "--timeout",
+            "120",
+            "--model",
+            "google/gemma-4-e4b",
+        ]);
+        assert_eq!(
+            args,
+            PrintArgs {
+                prompt: "fix the typo".into(),
+                max_rounds: 5,
+                timeout: Duration::from_secs(120),
+                stats: Some(PathBuf::from("out/stats.json")),
+                model: Some("google/gemma-4-e4b".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn help_wins_over_everything_else() {
+        assert_eq!(parse_strs(&["--help"]).unwrap(), Command::Help);
+        assert_eq!(parse_strs(&["-p", "x", "-h"]).unwrap(), Command::Help);
+    }
+
+    #[test]
+    fn a_missing_value_is_an_error() {
+        for option in [
+            "--print",
+            "-p",
+            "--max-rounds",
+            "--timeout",
+            "--stats",
+            "--model",
+        ] {
+            assert_eq!(
+                parse_error(&["-p", "x", option]),
+                format!("{option} needs a value")
+            );
+        }
+    }
+
+    #[test]
+    fn bad_values_and_unknown_arguments_are_errors() {
+        assert!(parse_error(&["-p", "x", "--max-rounds", "0"]).contains("above 0"));
+        assert!(parse_error(&["-p", "x", "--timeout", "-1"]).contains("above 0"));
+        assert!(parse_error(&["-p", "x", "--timeout", "1.5"]).contains("whole number"));
+        assert_eq!(
+            parse_error(&["-p", "x", "--fast"]),
+            "unknown argument: --fast"
+        );
+        assert_eq!(parse_error(&["hello"]), "unknown argument: hello");
+        assert!(parse_error(&["-p", "  "]).contains("non-empty"));
+        assert_eq!(parse_error(&["--model", "m"]), "--model needs --print");
+    }
+
+    fn usage(prompt_tokens: u64, completion_tokens: u64) -> AgentEvent {
+        AgentEvent::Usage {
+            prompt_tokens,
+            completion_tokens,
+        }
+    }
+
+    fn tool(id: &str, name: &str, summary: &str, is_error: bool) -> [AgentEvent; 2] {
+        [
+            AgentEvent::ToolStarted {
+                id: id.into(),
+                name: name.into(),
+                arguments: "{}".into(),
+            },
+            AgentEvent::ToolFinished {
+                id: id.into(),
+                name: name.into(),
+                summary: summary.into(),
+                is_error,
+            },
+        ]
+    }
+
+    #[test]
+    fn a_done_turn_folds_rounds_totals_tools_and_the_answer() {
+        let mut events = vec![
+            AgentEvent::Thinking,
+            AgentEvent::Text("Let me look.".into()),
+            usage(1000, 50),
+        ];
+        events.extend(tool("1", "read_file", "4 lines", false));
+        events.extend([AgentEvent::Thinking, usage(1200, 80)]);
+        events.extend(tool("2", "edit_file", "old text not found", true));
+        events.extend([
+            AgentEvent::Text("Fixed ".into()),
+            AgentEvent::Text("the typo.".into()),
+            usage(1401, 131),
+            AgentEvent::TurnDone,
+        ]);
+
+        let stats = fold_stats(&events, Duration::from_millis(10_300));
+        assert_eq!(stats.outcome, Outcome::Done);
+        assert_eq!(stats.error, None);
+        assert_eq!(stats.rounds, 3);
+        assert_eq!(stats.prompt_tokens_last, 1401);
+        assert_eq!(stats.prompt_tokens_total, 3601);
+        assert_eq!(stats.completion_tokens_total, 261);
+        assert_eq!(stats.answer, "Fixed the typo.");
+        assert_eq!(
+            stats.tool_calls,
+            [
+                ToolCallStat {
+                    name: "read_file".into(),
+                    summary: "4 lines".into(),
+                    is_error: false,
+                },
+                ToolCallStat {
+                    name: "edit_file".into(),
+                    summary: "old text not found".into(),
+                    is_error: true,
+                },
+            ]
+        );
+
+        let json = stats.to_json();
+        assert_eq!(json["outcome"], "done");
+        assert_eq!(json["error"], Value::Null);
+        assert_eq!(json["elapsed_ms"], 10_300);
+        assert_eq!(json["tool_calls"][1]["is_error"], true);
+        assert_eq!(json["answer"], "Fixed the typo.");
+    }
+
+    #[test]
+    fn a_failed_turn_keeps_its_error_and_has_no_answer_after_tools() {
+        let mut events = vec![AgentEvent::Text("Checking.".into()), usage(900, 20)];
+        events.extend(tool("1", "bash", "exit 0, 3 lines", false));
+        events.push(AgentEvent::TurnFailed("stopped after 1 tool rounds".into()));
+
+        let stats = fold_stats(&events, Duration::ZERO);
+        assert_eq!(stats.outcome, Outcome::Failed);
+        assert_eq!(stats.error.as_deref(), Some("stopped after 1 tool rounds"));
+        assert_eq!(stats.rounds, 1);
+        assert_eq!(stats.answer, "");
+        assert_eq!(stats.to_json()["outcome"], "failed");
+    }
+
+    #[test]
+    fn a_turn_without_a_final_event_counts_as_failed() {
+        let stats = fold_stats(&[AgentEvent::Thinking], Duration::ZERO);
+        assert_eq!(stats.outcome, Outcome::Failed);
+        assert!(stats.error.is_some());
+        assert_eq!(stats.rounds, 0);
+    }
+
+    #[test]
+    fn log_lines_name_the_tool_and_its_command() {
+        let started = AgentEvent::ToolStarted {
+            id: "1".into(),
+            name: "bash".into(),
+            arguments: r#"{"command":"cargo test\necho hi"}"#.into(),
+        };
+        assert_eq!(log_line(&started).unwrap(), "tool bash: $ cargo test …");
+        let [_, finished] = tool("1", "bash", "exit 0, 12 lines", false);
+        assert_eq!(log_line(&finished).unwrap(), "done bash: exit 0, 12 lines");
+        assert_eq!(log_line(&usage(1401, 131)).unwrap(), "usage 1401+131");
+        assert_eq!(log_line(&AgentEvent::Text("x".into())), None);
+        assert_eq!(call_label(r#"{"path":"notes.txt","old":"a"}"#), "notes.txt");
+        assert_eq!(call_label("not json"), "not json");
+    }
+}
