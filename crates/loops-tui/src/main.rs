@@ -30,7 +30,7 @@ use anyhow::{Result, anyhow};
 use crossterm::event::{Event, EventStream};
 use futures::StreamExt;
 use loops_core::{
-    agent::{Agent, default_environment, default_system_prompt},
+    agent::{Agent, INSTRUCTIONS_FILE, default_system_prompt, environment_with, load_instructions},
     backend::ModelBackend,
     lmstudio::LmStudio,
     tools::ToolSet,
@@ -39,7 +39,7 @@ use ratatui::DefaultTerminal;
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
-use app::{App, AppEvent, ModelEvent};
+use app::{App, AppEvent, ModelEvent, describe_instructions};
 
 /// How often [`AppEvent::Tick`] fires.
 const TICK: Duration = Duration::from_millis(250);
@@ -103,10 +103,29 @@ async fn run(mut terminal: DefaultTerminal) -> Result<()> {
             .send(AppEvent::Say("bash not found; the bash tool is off".into()))
             .await;
     }
-    let agent = Agent::new(backend, tools, Some(default_system_prompt()))
-        .with_environment(default_environment(&cwd));
+    // Project instructions ride in the environment block; say what was sent.
+    let (instructions, said) = match load_instructions(&cwd) {
+        Ok(Some(found)) => {
+            let described = describe_instructions(&found);
+            let said = format!("{INSTRUCTIONS_FILE} loaded, {described}");
+            (Some((found, described)), Some(said))
+        }
+        Ok(None) => (None, None),
+        Err(err) => (
+            None,
+            Some(format!("{INSTRUCTIONS_FILE} could not be read: {err}")),
+        ),
+    };
+    if let Some(said) = said {
+        let _ = tx.send(AppEvent::Say(said)).await;
+    }
+    let environment = environment_with(&cwd, instructions.as_ref().map(|(found, _)| found));
+    let agent =
+        Agent::new(backend, tools, Some(default_system_prompt())).with_environment(environment);
 
     let mut app = App::new(Arc::new(agent), tx, cwd);
+    app.instructions =
+        instructions.map(|(_, described)| format!("{INSTRUCTIONS_FILE}, {described}"));
     while !app.should_quit {
         terminal.draw(|frame| ui::draw(frame, &app))?;
 

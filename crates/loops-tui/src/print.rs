@@ -22,7 +22,10 @@ use std::{
 use anyhow::{Context, Result, bail};
 use loops_core::{
     Conversation, Message, Role,
-    agent::{Agent, AgentEvent, Decision, TurnOptions, default_environment, default_system_prompt},
+    agent::{
+        Agent, AgentEvent, Decision, INSTRUCTIONS_FILE, TurnOptions, default_system_prompt,
+        environment_with, load_instructions,
+    },
     backend::ModelBackend,
     chat::Thinking,
     lmstudio::{LmStudio, ModelInfo, ModelState},
@@ -30,6 +33,8 @@ use loops_core::{
 };
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
+
+use crate::app::describe_instructions;
 
 /// What `--help` prints.
 pub const USAGE: &str = "\
@@ -341,8 +346,22 @@ pub async fn run(args: PrintArgs) -> Result<u8> {
     if !tools.has("bash") {
         eprintln!("warning: bash not found; the bash tool is off");
     }
+    let instructions = match load_instructions(&cwd) {
+        Ok(Some(found)) => {
+            eprintln!(
+                "loops: {INSTRUCTIONS_FILE} loaded, {}",
+                describe_instructions(&found)
+            );
+            Some(found)
+        }
+        Ok(None) => None,
+        Err(err) => {
+            eprintln!("warning: {INSTRUCTIONS_FILE} could not be read: {err}");
+            None
+        }
+    };
     let mut agent = Agent::new(backend, tools, Some(default_system_prompt()))
-        .with_environment(default_environment(&cwd));
+        .with_environment(environment_with(&cwd, instructions.as_ref()));
     agent.max_iterations = args.max_rounds;
     let options = TurnOptions {
         context_length: info.context_length(),

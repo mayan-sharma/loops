@@ -50,7 +50,9 @@ use std::{
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use loops_core::{
     Conversation, Message, Role, ToolCall,
-    agent::{Agent, AgentEvent, CompactReport, Decision, TurnOptions},
+    agent::{
+        Agent, AgentEvent, CompactReport, Decision, INSTRUCTIONS_FILE, Instructions, TurnOptions,
+    },
     chat::Thinking,
     lmstudio::{ModelInfo, ModelState},
 };
@@ -230,7 +232,7 @@ impl PermissionOption {
 }
 
 /// Text pushed into the transcript by `/help`.
-const HELP_TEXT: &str = "commands:\n  /help             show this list\n  /model            pick and load a local model\n  /unload           unload the current model\n  /clear            clear the chat and start fresh\n  /context          tokens used and left in the model's window\n  /compact          summarise the chat so far to free the window\n  /think [level]    how much the model thinks: off, low, medium, high, default\n  /max-tokens [n]   cap each reply at n tokens (off for no cap)\n  /quit (or /exit)  exit (also Ctrl+C or Ctrl+D)\nkeys:\n  Esc               cancel the running turn\n  Ctrl+O            show full command output (toggle)\n  PageUp/PageDown/End  scroll the transcript\n  ↑/↓ + Enter       answer a permission prompt (1/2/3 also work)\ntools the model can use (inside this directory):\n  read_file, list_files         read only; never ask\n  edit_file, write_file, bash   change things; ask first\n  \"don't ask again\" for bash is per exact command";
+const HELP_TEXT: &str = "commands:\n  /help             show this list\n  /model            pick and load a local model\n  /unload           unload the current model\n  /clear            clear the chat and start fresh\n  /context          tokens used and left in the model's window\n  /compact          summarise the chat so far to free the window\n  /think [level]    how much the model thinks: off, low, medium, high, default\n  /max-tokens [n]   cap each reply at n tokens (off for no cap)\n  /quit (or /exit)  exit (also Ctrl+C or Ctrl+D)\nkeys:\n  Esc               cancel the running turn\n  Ctrl+O            show full command output (toggle)\n  PageUp/PageDown/End  scroll the transcript\n  ↑/↓ + Enter       answer a permission prompt (1/2/3 also work)\ntools the model can use (inside this directory):\n  read_file, list_files         read only; never ask\n  edit_file, write_file, bash   change things; ask first\n  \"don't ask again\" for bash is per exact command\n  AGENTS.md in the working directory is read at start and sent to the model";
 
 /// Said when something must wait for the current turn (or `/compact`).
 const BUSY_TEXT: &str = "a turn is running; wait for it or press Esc to cancel";
@@ -293,6 +295,10 @@ pub struct App {
     pub usage: Option<Usage>,
     /// The directory loops works in, for the banner.
     pub cwd: PathBuf,
+    /// What project instructions the model was given, for `/context`, e.g.
+    /// `AGENTS.md, about 420 tokens`; `None` when there were none. Set by
+    /// `main` after [`App::new`].
+    pub instructions: Option<String>,
     /// How many lines the transcript is scrolled up from the bottom; 0
     /// follows new output. Not clamped here: only the draw knows how tall the
     /// wrapped transcript is, so it clamps, and scrolling past the top is harmless.
@@ -369,6 +375,7 @@ impl App {
             max_output_tokens: None,
             usage: None,
             cwd,
+            instructions: None,
             scroll_up: 0,
             turn: None,
             compaction: None,
@@ -826,8 +833,18 @@ impl App {
 
     /// `/context`: how much of the model's window the conversation fills, from
     /// the last request's usage and the loaded model's context length, then
-    /// the limits the next request goes out with.
+    /// the limits the next request goes out with, then the project
+    /// instructions sent with it.
     fn context_report(&self) -> String {
+        let instructions = match &self.instructions {
+            Some(described) => format!("instructions: {described}"),
+            None => format!("instructions: none (no {INSTRUCTIONS_FILE} in the working directory)"),
+        };
+        format!("{}\n{instructions}", self.window_report())
+    }
+
+    /// The window and settings lines of [`Self::context_report`].
+    fn window_report(&self) -> String {
         let settings = format!("thinking: {}, {}", self.thinking, self.reply_cap());
         let Some(model) = self.loaded_model() else {
             return format!("context: no model loaded\n{settings}");
@@ -1228,6 +1245,22 @@ impl App {
     /// Pushes a harness-authored line into the transcript.
     fn say(&mut self, text: impl Into<String>) {
         self.conversation.push(Message::new(Role::Harness, text));
+    }
+}
+
+/// How much of the project instructions file the model gets, after its name:
+/// `about 420 tokens`, or `cut to the first 8,000 of 12,345 characters (about
+/// 2,000 tokens)` when it was too long.
+pub(crate) fn describe_instructions(instructions: &Instructions) -> String {
+    let tokens = thousands(instructions.estimated_tokens());
+    if instructions.truncated {
+        format!(
+            "cut to the first {} of {} characters (about {tokens} tokens)",
+            thousands(instructions.shown_chars as u64),
+            thousands(instructions.total_chars as u64)
+        )
+    } else {
+        format!("about {tokens} tokens")
     }
 }
 
@@ -2700,7 +2733,8 @@ mod tests {
         app.model_status = ModelStatus::NoModel;
         assert_eq!(
             context_says(&mut app),
-            "context: no model loaded\nthinking: default, reply cap: none"
+            "context: no model loaded\nthinking: default, reply cap: none\n\
+             instructions: none (no AGENTS.md in the working directory)"
         );
     }
 
@@ -2710,7 +2744,8 @@ mod tests {
         assert_eq!(
             context_says(&mut app),
             "context: nothing sent yet; the window is 8,192 tokens (google/gemma-4-e4b)\n\
-             thinking: default, reply cap: none"
+             thinking: default, reply cap: none\n\
+             instructions: none (no AGENTS.md in the working directory)"
         );
     }
 
@@ -2721,7 +2756,8 @@ mod tests {
             context_says(&mut app),
             "context: 1,532 of 8,192 tokens used (19%), 6,660 left\n\
              last request: 1,401 prompt + 131 reply (google/gemma-4-e4b)\n\
-             thinking: default, reply cap: none"
+             thinking: default, reply cap: none\n\
+             instructions: none (no AGENTS.md in the working directory)"
         );
     }
 
@@ -2732,7 +2768,8 @@ mod tests {
             context_says(&mut app),
             "context: 9,000 of 8,192 tokens used (over the window by 808)\n\
              last request: 8,000 prompt + 1,000 reply (google/gemma-4-e4b)\n\
-             thinking: default, reply cap: none"
+             thinking: default, reply cap: none\n\
+             instructions: none (no AGENTS.md in the working directory)"
         );
     }
 
@@ -2745,7 +2782,39 @@ mod tests {
             context_says(&mut app),
             "context: 1,532 tokens used of an unknown window\n\
              last request: 1,401 prompt + 131 reply (google/gemma-4-e4b)\n\
-             thinking: off, reply cap: 2,048 tokens"
+             thinking: off, reply cap: 2,048 tokens\n\
+             instructions: none (no AGENTS.md in the working directory)"
+        );
+    }
+
+    #[test]
+    fn context_names_the_instructions_sent() {
+        let mut app = context_app(Some(8192), None);
+        app.instructions = Some("AGENTS.md, about 420 tokens".into());
+        assert_eq!(
+            context_says(&mut app),
+            "context: nothing sent yet; the window is 8,192 tokens (google/gemma-4-e4b)\n\
+             thinking: default, reply cap: none\n\
+             instructions: AGENTS.md, about 420 tokens"
+        );
+    }
+
+    #[test]
+    fn instructions_are_described_by_size_and_any_cut() {
+        let mut instructions = Instructions {
+            text: "x".repeat(1_680),
+            total_chars: 1_680,
+            shown_chars: 1_680,
+            truncated: false,
+        };
+        assert_eq!(describe_instructions(&instructions), "about 420 tokens");
+        instructions.text = "x".repeat(8_000);
+        instructions.total_chars = 12_345;
+        instructions.shown_chars = 7_950;
+        instructions.truncated = true;
+        assert_eq!(
+            describe_instructions(&instructions),
+            "cut to the first 7,950 of 12,345 characters (about 2,000 tokens)"
         );
     }
 
@@ -2758,7 +2827,8 @@ mod tests {
         assert_eq!(
             said,
             "context: nothing sent yet; the window is 8,192 tokens (google/gemma-4-e4b)\n\
-             thinking: default, reply cap: none"
+             thinking: default, reply cap: none\n\
+             instructions: none (no AGENTS.md in the working directory)"
         );
         assert!(app.turn.is_some());
     }

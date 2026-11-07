@@ -740,6 +740,82 @@ pub fn default_environment(cwd: &Path) -> String {
     )
 }
 
+/// The project instructions file read from the working directory at start.
+pub const INSTRUCTIONS_FILE: &str = "AGENTS.md";
+
+/// Most characters of [`INSTRUCTIONS_FILE`] sent to the model: about 2k
+/// tokens, since a small local model's window is 8k-16k.
+pub const INSTRUCTIONS_MAX_CHARS: usize = 8_000;
+
+/// Project instructions loaded from [`INSTRUCTIONS_FILE`] (see
+/// [`load_instructions`]), for [`environment_with`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Instructions {
+    /// What is sent: the file with trailing whitespace trimmed, cut at a line
+    /// end and followed by a note saying so when it was too long.
+    pub text: String,
+    /// Characters in the file, trailing whitespace trimmed.
+    pub total_chars: usize,
+    /// Characters of the file in `text` (all of them unless `truncated`).
+    pub shown_chars: usize,
+    /// Whether the file was longer than [`INSTRUCTIONS_MAX_CHARS`] and was cut.
+    pub truncated: bool,
+}
+
+impl Instructions {
+    /// A characters/4 guess at the tokens `text` adds to every request.
+    pub fn estimated_tokens(&self) -> u64 {
+        estimate_tokens(self.text.chars().count())
+    }
+}
+
+/// Reads [`INSTRUCTIONS_FILE`] in `cwd`: `Ok(None)` when there is none. A file
+/// over [`INSTRUCTIONS_MAX_CHARS`] characters is cut at the last line break
+/// before the limit (or at the limit when there is none), with a note.
+pub fn load_instructions(cwd: &Path) -> std::io::Result<Option<Instructions>> {
+    let raw = match std::fs::read_to_string(cwd.join(INSTRUCTIONS_FILE)) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let full = raw.trim_end();
+    let total_chars = full.chars().count();
+    let Some((limit, _)) = full.char_indices().nth(INSTRUCTIONS_MAX_CHARS) else {
+        return Ok(Some(Instructions {
+            text: full.to_owned(),
+            total_chars,
+            shown_chars: total_chars,
+            truncated: false,
+        }));
+    };
+    let head = &full[..limit];
+    let shown = head[..head.rfind('\n').unwrap_or(limit)].trim_end();
+    let shown_chars = shown.chars().count();
+    Ok(Some(Instructions {
+        text: format!(
+            "{shown}\n[… cut here; {INSTRUCTIONS_FILE} has {total_chars} characters, \
+             the first {shown_chars} are shown …]"
+        ),
+        total_chars,
+        shown_chars,
+        truncated: true,
+    }))
+}
+
+/// [`default_environment`] plus, when given, the project instructions under a
+/// heading telling the model to follow them.
+pub fn environment_with(cwd: &Path, instructions: Option<&Instructions>) -> String {
+    let mut environment = default_environment(cwd);
+    if let Some(instructions) = instructions {
+        environment.push_str(&format!(
+            "\n\nproject instructions, from {INSTRUCTIONS_FILE} in the working directory \
+             (follow them):\n{}",
+            instructions.text
+        ));
+    }
+    environment
+}
+
 #[cfg(test)]
 mod tests {
     use std::{path::PathBuf, sync::Mutex, time::Instant};
@@ -1568,6 +1644,118 @@ mod tests {
             "first",
             "stored copy untouched"
         );
+    }
+
+    #[test]
+    fn instructions_are_none_without_an_agents_file() {
+        let dir = TempDir::new("instructions-missing");
+        assert_eq!(load_instructions(&dir.0).unwrap(), None);
+    }
+
+    #[test]
+    fn instructions_are_the_file_with_trailing_whitespace_trimmed() {
+        let dir = TempDir::new("instructions-present");
+        dir.write(INSTRUCTIONS_FILE, "Run cargo test.\nBe brief.\n\n");
+        let instructions = load_instructions(&dir.0).unwrap().unwrap();
+        assert_eq!(instructions.text, "Run cargo test.\nBe brief.");
+        assert_eq!(instructions.total_chars, 25);
+        assert_eq!(instructions.shown_chars, 25);
+        assert!(!instructions.truncated);
+        assert_eq!(instructions.estimated_tokens(), 7);
+    }
+
+    /// 90 lines of 100 characters (newline included) is over the limit, so
+    /// the text stops at the end of line 80 with a note.
+    #[test]
+    fn long_instructions_are_cut_at_a_line_end_with_a_note() {
+        let dir = TempDir::new("instructions-long");
+        let line = format!("{}\n", "x".repeat(99));
+        dir.write(INSTRUCTIONS_FILE, line.repeat(90));
+        let instructions = load_instructions(&dir.0).unwrap().unwrap();
+        assert!(instructions.truncated);
+        assert_eq!(instructions.total_chars, 8_999);
+        assert_eq!(instructions.shown_chars, 7_999);
+        let (shown, note) = instructions.text.rsplit_once('\n').unwrap();
+        assert_eq!(shown, line.repeat(80).trim_end());
+        assert_eq!(
+            note,
+            "[… cut here; AGENTS.md has 8999 characters, the first 7999 are shown …]"
+        );
+    }
+
+    /// With no line break before the limit, the cut falls on the limit itself,
+    /// on a character boundary.
+    #[test]
+    fn instructions_without_line_breaks_are_cut_at_the_limit() {
+        let dir = TempDir::new("instructions-one-line");
+        dir.write(INSTRUCTIONS_FILE, "é".repeat(9_000));
+        let instructions = load_instructions(&dir.0).unwrap().unwrap();
+        assert!(instructions.truncated);
+        assert_eq!(instructions.shown_chars, INSTRUCTIONS_MAX_CHARS);
+        assert!(instructions.text.starts_with(&"é".repeat(8_000)));
+        assert!(instructions.text.ends_with("the first 8000 are shown …]"));
+    }
+
+    #[test]
+    fn environment_with_instructions_appends_them_under_a_heading() {
+        let cwd = Path::new("/work/repo");
+        assert_eq!(environment_with(cwd, None), default_environment(cwd));
+
+        let instructions = Instructions {
+            text: "Be brief.".into(),
+            total_chars: 9,
+            shown_chars: 9,
+            truncated: false,
+        };
+        assert_eq!(
+            environment_with(cwd, Some(&instructions)),
+            format!(
+                "{}\n\nproject instructions, from AGENTS.md in the working directory \
+                 (follow them):\nBe brief.",
+                default_environment(cwd)
+            )
+        );
+    }
+
+    /// Instructions in the environment reach the model on the first user
+    /// message, inside the environment block.
+    #[tokio::test]
+    async fn instructions_arrive_with_the_environment_on_the_first_user_message() {
+        let backend = Arc::new(Scripted {
+            rounds: vec![vec![text("ok")]],
+            ..Scripted::default()
+        });
+        let dir = TempDir::new("instructions-sent");
+        dir.write(INSTRUCTIONS_FILE, "Answer in French.\n");
+        let instructions = load_instructions(&dir.0).unwrap();
+        let environment = environment_with(&dir.0, instructions.as_ref());
+        let agent = agent(Arc::clone(&backend)).with_environment(environment.clone());
+
+        let mut conversation = Conversation::new();
+        conversation.push(Message::new(Role::User, "hi"));
+        let (tx, _rx) = mpsc::channel(256);
+        agent
+            .run_turn(
+                "m",
+                &mut conversation,
+                tx,
+                answers(&[]),
+                &TurnOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        let sent = backend.requests.lock().unwrap();
+        let (request, _tools) = sent.last().unwrap();
+        let first_user = request.iter().find(|m| m.role == Role::User).unwrap();
+        assert_eq!(
+            first_user.content,
+            format!("<environment>\n{environment}\n</environment>\n\nhi")
+        );
+        assert!(first_user.content.contains(
+            "project instructions, from AGENTS.md in the working directory \
+             (follow them):\nAnswer in French.\n</environment>"
+        ));
     }
 
     /// An agent over `backend` with every standard tool, the ones that
