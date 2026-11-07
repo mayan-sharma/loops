@@ -36,6 +36,16 @@
 //! conversation, and blocks sending the same way; Esc cancels it. When it
 //! finishes, the compacted copy replaces the transcript, as `/clear` would.
 //!
+//! # Sessions
+//!
+//! The conversation is saved as a session (see [`loops_core::session`]) after
+//! every turn, finished or cancelled, after `/compact`, when switching to
+//! another session, and on quit; a conversation nobody has typed in is never
+//! saved. The display state the transcript needs besides the messages (tool
+//! outcomes, previews, command output, reply endings) is saved with it, so a
+//! resumed session looks as it did. `/clear` (or `/new`) saves the current
+//! session and starts another; `/sessions` lists them to resume one.
+//!
 //! Because `update` takes plain values and touches no terminal, it can be unit
 //! tested by feeding it synthetic key events (see the tests at the bottom).
 
@@ -55,9 +65,11 @@ use loops_core::{
     },
     chat::Thinking,
     lmstudio::{ModelInfo, ModelState},
+    session::{Session, SessionStore, SessionSummary, title_from, unix_now},
 };
 use ratatui::style::{Modifier, Style};
 use ratatui_textarea::TextArea;
+use serde::{Deserialize, Serialize};
 use tokio::{sync::mpsc, task::AbortHandle};
 
 /// Something the main loop must react to.
@@ -106,7 +118,7 @@ pub enum TurnEvent {
 }
 
 /// How a finished tool call went, for its `tool:` line.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolOutcome {
     /// One line, e.g. `31 lines`, or the error text.
     pub summary: String,
@@ -115,7 +127,7 @@ pub struct ToolOutcome {
 }
 
 /// How a reply ended, when that needs showing after its text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReplyEnd {
     /// Finished without answer text; drawn as a dim `(empty reply)`.
     Empty,
@@ -184,6 +196,13 @@ pub enum Mode {
         /// Highlighted row.
         selected: usize,
     },
+    /// The saved sessions of this directory are listed (`/sessions`).
+    Sessions {
+        /// Newest first, as the store lists them.
+        entries: Vec<SessionSummary>,
+        /// Highlighted row.
+        selected: usize,
+    },
     /// Asking `Load <id>? (y/n)` for `models[selected]`. Kept so `n` can return to the list.
     Confirm {
         /// Same list the picker showed.
@@ -232,10 +251,16 @@ impl PermissionOption {
 }
 
 /// Text pushed into the transcript by `/help`.
-const HELP_TEXT: &str = "commands:\n  /help             show this list\n  /model            pick and load a local model\n  /unload           unload the current model\n  /clear            clear the chat and start fresh\n  /context          tokens used and left in the model's window\n  /compact          summarise the chat so far to free the window\n  /think [level]    how much the model thinks: off, low, medium, high, default\n  /max-tokens [n]   cap each reply at n tokens (off for no cap)\n  /quit (or /exit)  exit (also Ctrl+C or Ctrl+D)\nkeys:\n  Esc               cancel the running turn\n  Ctrl+O            show full command output (toggle)\n  PageUp/PageDown/End  scroll the transcript\n  ↑/↓ + Enter       answer a permission prompt (1/2/3 also work)\ntools the model can use (inside this directory):\n  read_file, list_files         read only; never ask\n  edit_file, write_file, bash   change things; ask first\n  \"don't ask again\" for bash is per exact command\n  AGENTS.md in the working directory is read at start and sent to the model";
+const HELP_TEXT: &str = "commands:\n  /help             show this list\n  /model            pick and load a local model\n  /unload           unload the current model\n  /clear            start a new session; the old one stays saved\n  /new              start a new session (same as /clear)\n  /sessions         list this directory's sessions and resume one\n  /context          tokens used and left in the model's window\n  /compact          summarise the chat so far to free the window\n  /think [level]    how much the model thinks: off, low, medium, high, default\n  /max-tokens [n]   cap each reply at n tokens (off for no cap)\n  /quit (or /exit)  exit (also Ctrl+C or Ctrl+D)\nkeys:\n  Esc               cancel the running turn\n  Ctrl+O            show full command output (toggle)\n  PageUp/PageDown/End  scroll the transcript\n  ↑/↓ + Enter       answer a permission prompt (1/2/3 also work)\ntools the model can use (inside this directory):\n  read_file, list_files         read only; never ask\n  edit_file, write_file, bash   change things; ask first\n  \"don't ask again\" for bash is per exact command\n  AGENTS.md in the working directory is read at start and sent to the model";
 
 /// Said when something must wait for the current turn (or `/compact`).
 const BUSY_TEXT: &str = "a turn is running; wait for it or press Esc to cancel";
+
+/// Said by `/sessions` and `--resume` when there is no home directory.
+const SESSIONS_OFF_TEXT: &str = "sessions are off: no home directory";
+
+/// Said by `/sessions` and `--resume` when nothing was saved here yet.
+const NO_SESSIONS_TEXT: &str = "no saved sessions for this directory";
 
 /// Said when something must wait for `/unload` to finish.
 const UNLOADING_TEXT: &str = "a model is unloading; wait for it";
@@ -303,6 +328,21 @@ pub struct App {
     /// follows new output. Not clamped here: only the draw knows how tall the
     /// wrapped transcript is, so it clamps, and scrolling past the top is harmless.
     pub scroll_up: usize,
+    /// Where sessions are saved; `None` when they are off (no home
+    /// directory). Set by `main` with [`App::with_sessions`].
+    pub sessions: Option<SessionStore>,
+    /// The current session's id; its file is written on the first save.
+    pub session_id: String,
+    /// When the current session started, in unix seconds.
+    pub session_created: u64,
+    /// The model the current session last ran a turn with.
+    pub session_model: Option<String>,
+    /// The current session's title, fixed by its first save so that
+    /// `/compact` (whose summary becomes the first user message) keeps it.
+    session_title: String,
+    /// Whether saving the current session failed and that was said, so a
+    /// broken disk is reported once per session, not after every turn.
+    save_failed: bool,
     /// The turn running, if any.
     turn: Option<Turn>,
     /// The `/compact` running, if any. Never at the same time as a turn.
@@ -377,12 +417,24 @@ impl App {
             cwd,
             instructions: None,
             scroll_up: 0,
+            sessions: None,
+            session_id: SessionStore::new_id(),
+            session_created: unix_now(),
+            session_model: None,
+            session_title: String::new(),
+            save_failed: false,
             turn: None,
             compaction: None,
             next_turn: 0,
             agent,
             events,
         }
+    }
+
+    /// Saves sessions to `store` from now on; `None` turns them off.
+    pub fn with_sessions(mut self, store: Option<SessionStore>) -> Self {
+        self.sessions = store;
+        self
     }
 
     /// Whether a turn or `/compact` is running (so Esc would cancel it, and
@@ -429,13 +481,14 @@ impl App {
 
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && matches!(key.code, KeyCode::Char('c' | 'd')) {
-            self.should_quit = true;
+            self.quit();
             return;
         }
 
         match self.mode {
             Mode::Normal => self.on_input_key(key),
             Mode::Picker { .. } => self.on_picker_key(key.code),
+            Mode::Sessions { .. } => self.on_sessions_key(key.code),
             Mode::Confirm { .. } => self.on_confirm_key(key.code),
             Mode::Permission { .. } => self.on_permission_key(key.code),
         }
@@ -515,6 +568,29 @@ impl App {
                 let models = std::mem::take(models);
                 let selected = *selected;
                 self.mode = Mode::Confirm { models, selected };
+            }
+            KeyCode::Esc => self.mode = Mode::Normal,
+            _ => {}
+        }
+    }
+
+    /// Keys while the session list is open: Up/Down move, Enter resumes the
+    /// highlighted session, Esc closes the list.
+    fn on_sessions_key(&mut self, code: KeyCode) {
+        let Mode::Sessions { entries, selected } = &mut self.mode else {
+            return;
+        };
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                if *selected + 1 < entries.len() {
+                    *selected += 1;
+                }
+            }
+            KeyCode::Enter => {
+                let id = entries[*selected].id.clone();
+                self.mode = Mode::Normal;
+                self.switch_session(&id);
             }
             KeyCode::Esc => self.mode = Mode::Normal,
             _ => {}
@@ -637,6 +713,7 @@ impl App {
         let history = self.conversation.clone();
         self.conversation.push(Message::new(Role::Assistant, ""));
         self.model_status = ModelStatus::Busy(model.clone());
+        self.session_model = Some(model.clone());
         self.spawn_turn(model, history, start);
         true
     }
@@ -667,26 +744,174 @@ impl App {
         let name = words.next().unwrap_or("");
         let arg = words.next();
         match name {
-            "quit" | "exit" => self.should_quit = true,
+            "quit" | "exit" => self.quit(),
             "help" => self.say(HELP_TEXT),
             // Only reads state, so it works while a turn runs.
             "context" => self.say(self.context_report()),
             // Settings for the next request, so they work while a turn runs.
             "think" => self.think(arg),
             "max-tokens" => self.max_tokens(arg),
-            "model" | "unload" | "clear" | "compact" if self.busy() => self.say(BUSY_TEXT),
+            "model" | "unload" | "clear" | "new" | "compact" | "sessions" if self.busy() => {
+                self.say(BUSY_TEXT);
+            }
             "model" if self.is_unloading() => self.say(UNLOADING_TEXT),
             "model" => self.spawn_list(),
             "unload" => self.unload(),
-            "clear" => self.clear(),
+            "clear" | "new" => self.start_new_session(),
+            "sessions" => self.open_sessions(),
             "compact" => self.compact(),
             _ => self.say(format!("unknown command: /{name}")),
         }
     }
 
-    /// `/clear`: forgets the conversation so the next message starts fresh.
-    /// The model stays loaded and tools the user always-allowed stay allowed;
-    /// only what was said goes. Refused while a turn runs.
+    /// `/quit`, Ctrl+C: ends a running turn as Esc would (so what is saved
+    /// can be sent again), saves the session, and asks the main loop to stop.
+    fn quit(&mut self) {
+        self.cancel_turn();
+        self.end_compaction();
+        self.save_session();
+        self.should_quit = true;
+    }
+
+    /// `/clear` and `/new`: saves the current session and starts another
+    /// with an empty conversation. The model stays loaded and tools the user
+    /// always-allowed stay allowed. Refused while a turn runs.
+    fn start_new_session(&mut self) {
+        self.save_session();
+        self.clear();
+        self.session_id = SessionStore::new_id();
+        self.session_created = unix_now();
+        self.session_model = None;
+        self.session_title.clear();
+        self.save_failed = false;
+    }
+
+    /// `/sessions`: opens the list of this directory's saved sessions, or
+    /// says why there is nothing to list.
+    fn open_sessions(&mut self) {
+        let Some(store) = &self.sessions else {
+            self.say(SESSIONS_OFF_TEXT);
+            return;
+        };
+        match store.list() {
+            Ok(entries) if entries.is_empty() => self.say(NO_SESSIONS_TEXT),
+            Ok(entries) => {
+                self.mode = Mode::Sessions {
+                    entries,
+                    selected: 0,
+                };
+            }
+            Err(err) => self.say(format!("error: sessions could not be listed: {err}")),
+        }
+    }
+
+    /// `loops --resume [id]`: switches to session `id`, or to the latest
+    /// one of this directory, saying why when there is none.
+    pub fn resume(&mut self, id: Option<&str>) {
+        if let Some(id) = id {
+            self.switch_session(id);
+            return;
+        }
+        let Some(store) = &self.sessions else {
+            self.say(SESSIONS_OFF_TEXT);
+            return;
+        };
+        match store.latest() {
+            Ok(Some(latest)) => self.switch_session(&latest.id),
+            Ok(None) => self.say(NO_SESSIONS_TEXT),
+            Err(err) => self.say(format!("error: sessions could not be listed: {err}")),
+        }
+    }
+
+    /// Saves the current session and makes session `id` current: its
+    /// messages and display state replace the transcript. Switching to the
+    /// current session changes nothing; a session that cannot be loaded is
+    /// reported and the current one stays.
+    pub fn switch_session(&mut self, id: &str) {
+        if id == self.session_id {
+            return;
+        }
+        let Some(store) = &self.sessions else {
+            self.say(SESSIONS_OFF_TEXT);
+            return;
+        };
+        let session = match store.load(id) {
+            Ok(Some(session)) => session,
+            Ok(None) => {
+                self.say(format!("no session {id}"));
+                return;
+            }
+            Err(err) => {
+                self.say(format!("error: session {id} could not be loaded: {err}"));
+                return;
+            }
+        };
+        self.save_session();
+        self.clear();
+        let view: View = serde_json::from_value(session.view).unwrap_or_default();
+        self.tool_outcomes = view.tool_outcomes;
+        self.tool_previews = view.tool_previews;
+        self.tool_outputs = view.tool_outputs;
+        self.reply_ends = view.reply_ends.into_iter().collect();
+        let count = session.messages.len();
+        self.conversation.replace_all(session.messages);
+        self.session_id = session.id;
+        self.session_created = session.created;
+        self.session_model = session.model;
+        self.session_title = session.title;
+        self.save_failed = false;
+        self.scroll_up = 0;
+        let title = if self.session_title.is_empty() {
+            "(untitled)"
+        } else {
+            &self.session_title
+        };
+        self.say(format!("resumed \"{title}\" ({count} messages)"));
+    }
+
+    /// Writes the current session to the store. Does nothing when sessions
+    /// are off or nobody has typed a message yet; a failure is said once
+    /// per session.
+    fn save_session(&mut self) {
+        let Some(store) = &self.sessions else {
+            return;
+        };
+        let messages = self.conversation.messages();
+        if !messages.iter().any(|m| m.role == Role::User) {
+            return;
+        }
+        if self.session_title.is_empty() {
+            self.session_title = title_from(messages);
+        }
+        let mut reply_ends: Vec<(usize, ReplyEnd)> =
+            self.reply_ends.iter().map(|(i, end)| (*i, *end)).collect();
+        reply_ends.sort_by_key(|(i, _)| *i);
+        let view = View {
+            tool_outcomes: self.tool_outcomes.clone(),
+            tool_previews: self.tool_previews.clone(),
+            tool_outputs: self.tool_outputs.clone(),
+            reply_ends,
+        };
+        let session = Session {
+            id: self.session_id.clone(),
+            title: self.session_title.clone(),
+            model: self.session_model.clone(),
+            cwd: self.cwd.display().to_string(),
+            created: self.session_created,
+            updated: unix_now(),
+            messages: messages.to_vec(),
+            view: serde_json::to_value(view).unwrap_or_default(),
+        };
+        if let Err(err) = store.save(&session)
+            && !self.save_failed
+        {
+            self.save_failed = true;
+            self.say(format!("session not saved: {err}"));
+        }
+    }
+
+    /// Forgets the conversation and its display state, so the next message
+    /// starts fresh. Only what was said goes.
     fn clear(&mut self) {
         self.conversation = Conversation::new();
         self.reply_ends.clear();
@@ -755,6 +980,11 @@ impl App {
             .filter(|m| m.role == Role::Harness)
             .cloned()
             .collect();
+        // The summary becomes the first user message; the title stays what
+        // the user first asked.
+        if self.session_title.is_empty() {
+            self.session_title = title_from(self.conversation.messages());
+        }
         self.clear();
         self.conversation = conversation;
         self.scroll_up = 0;
@@ -766,6 +996,7 @@ impl App {
             thousands(report.before),
             thousands(report.after)
         ));
+        self.save_session();
     }
 
     /// Esc while `/compact` runs: stop it; the conversation stays as it was.
@@ -840,7 +1071,19 @@ impl App {
             Some(described) => format!("instructions: {described}"),
             None => format!("instructions: none (no {INSTRUCTIONS_FILE} in the working directory)"),
         };
-        format!("{}\n{instructions}", self.window_report())
+        let session = match &self.sessions {
+            Some(store) => format!(
+                "session: {} ({} messages, {})",
+                self.session_id,
+                self.conversation.messages().len(),
+                store.dir().display()
+            ),
+            None => format!(
+                "session: {} (not saved: no home directory)",
+                self.session_id
+            ),
+        };
+        format!("{}\n{instructions}\n{session}", self.window_report())
     }
 
     /// The window and settings lines of [`Self::context_report`].
@@ -1097,6 +1340,7 @@ impl App {
         for message in said {
             self.conversation.push(message);
         }
+        self.save_session();
     }
 
     /// Esc while a turn runs: stop it and keep the text that arrived, marked
@@ -1122,6 +1366,9 @@ impl App {
             }
         }
         self.reply_ends.insert(reply, ReplyEnd::Cancelled);
+        // The task's `Finished` is dropped as stale, so `finish_turn` does
+        // not run: save here.
+        self.save_session();
     }
 
     /// Stops the turn's task (harmless if it already finished), closes its
@@ -1246,6 +1493,22 @@ impl App {
     fn say(&mut self, text: impl Into<String>) {
         self.conversation.push(Message::new(Role::Harness, text));
     }
+}
+
+/// The display state saved with a session ([`Session::view`]): the maps the
+/// transcript draws from besides the messages.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct View {
+    /// [`App::tool_outcomes`].
+    tool_outcomes: HashMap<String, ToolOutcome>,
+    /// [`App::tool_previews`].
+    tool_previews: HashMap<String, String>,
+    /// [`App::tool_outputs`].
+    tool_outputs: HashMap<String, String>,
+    /// [`App::reply_ends`] as `(index, end)` pairs, since JSON object keys
+    /// cannot be numbers.
+    reply_ends: Vec<(usize, ReplyEnd)>,
 }
 
 /// How much of the project instructions file the model gets, after its name:
@@ -2706,12 +2969,15 @@ mod tests {
         assert_eq!(app.usage, None);
     }
 
-    /// What `/context` says.
+    /// What `/context` says, up to its last line, which names the session
+    /// (see `context_names_the_session`).
     fn context_says(app: &mut App) -> String {
         type_line(app, "/context");
         let last = app.conversation.messages().last().unwrap();
         assert_eq!(last.role, Role::Harness);
-        last.content.clone()
+        let (said, session) = last.content.rsplit_once('\n').unwrap();
+        assert!(session.starts_with("session: "), "{session}");
+        said.to_owned()
     }
 
     /// An app with [`READY_MODEL`] ready, `window` tokens of context, and
@@ -3023,7 +3289,7 @@ mod tests {
         app.update(key(KeyCode::Esc));
         type_line(&mut app, "/compact");
         assert!(app.compacting());
-        for command in ["/compact", "/clear", "/model"] {
+        for command in ["/compact", "/clear", "/new", "/sessions", "/model"] {
             type_line(&mut app, command);
             assert_eq!(last_said(&app), BUSY_TEXT);
         }
@@ -3114,5 +3380,285 @@ mod tests {
         app.update(stale());
         assert_eq!(app.conversation.messages(), before);
         assert!(app.compacting(), "the newer one goes on");
+    }
+
+    // --- sessions ---------------------------------------------------------
+
+    /// Saves `app`'s sessions in `dir`.
+    fn save_in(app: &mut App, dir: &TempDir) {
+        app.sessions = Some(SessionStore::in_dir(dir.0.clone()));
+    }
+
+    /// The sessions saved in `dir`, newest first.
+    fn saved(dir: &TempDir) -> Vec<SessionSummary> {
+        SessionStore::in_dir(dir.0.clone()).list().unwrap()
+    }
+
+    /// Session `id` as saved in `dir`.
+    fn load(dir: &TempDir, id: &str) -> Session {
+        SessionStore::in_dir(dir.0.clone())
+            .load(id)
+            .unwrap()
+            .expect(id)
+    }
+
+    #[tokio::test]
+    async fn a_finished_turn_saves_the_session() {
+        let dir = TempDir::new("session-turn");
+        let (mut app, _backend, mut rx) = chat_app(vec![vec![content("done")]]);
+        save_in(&mut app, &dir);
+        type_line(&mut app, "fix the bug");
+        run_to_end(&mut app, &mut rx).await;
+
+        let listed = saved(&dir);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, app.session_id);
+        assert_eq!(listed[0].title, "fix the bug");
+        let session = load(&dir, &app.session_id);
+        assert_eq!(session.messages, app.conversation.messages());
+        assert_eq!(session.model.as_deref(), Some(READY_MODEL));
+        assert_eq!(session.cwd, r"D:\projects\loops");
+        assert_eq!(session.created, app.session_created);
+    }
+
+    #[test]
+    fn nothing_is_saved_until_someone_types() {
+        let dir = TempDir::new("session-unsaid");
+        let mut app = plain_app();
+        save_in(&mut app, &dir);
+        type_line(&mut app, "/help");
+        type_line(&mut app, "/clear");
+        type_line(&mut app, "/quit");
+        assert!(app.should_quit);
+        assert!(std::fs::read_dir(&dir.0).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn quitting_saves_the_session() {
+        let dir = TempDir::new("session-quit");
+        let mut app = plain_app();
+        save_in(&mut app, &dir);
+        chatted(&mut app);
+        app.update(AppEvent::Key(KeyEvent::new(
+            KeyCode::Char('d'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(app.should_quit);
+        assert_eq!(saved(&dir)[0].id, app.session_id);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_turn_is_saved_marked_cancelled() {
+        let dir = TempDir::new("session-cancel");
+        let (mut app, _backend, _rx) = chat_app(Vec::new());
+        save_in(&mut app, &dir);
+        type_line(&mut app, "hi");
+        app.update(agent_event(&app, text("partial")));
+        app.update(key(KeyCode::Esc));
+
+        let session = load(&dir, &app.session_id);
+        assert_eq!(
+            session.messages,
+            [
+                Message::new(Role::User, "hi"),
+                Message::new(Role::Assistant, "partial")
+            ]
+        );
+        assert_eq!(
+            session.view["reply_ends"],
+            serde_json::json!([[1, "Cancelled"]])
+        );
+    }
+
+    #[tokio::test]
+    async fn the_compacted_conversation_is_saved_under_the_first_title() {
+        let dir = TempDir::new("session-compact");
+        let (mut app, _backend, mut rx) = chat_app(vec![vec![content("Greeted.")]]);
+        save_in(&mut app, &dir);
+        chatted(&mut app);
+        type_line(&mut app, "/compact");
+        compact_to_end(&mut app, &mut rx).await;
+
+        let session = load(&dir, &app.session_id);
+        assert_eq!(session.messages, app.conversation.messages());
+        assert!(session.messages[0].content.starts_with("Summary of"));
+        assert_eq!(session.title, "hi");
+    }
+
+    #[test]
+    fn clear_and_new_save_the_session_and_start_another() {
+        let dir = TempDir::new("session-clear");
+        let mut app = plain_app();
+        save_in(&mut app, &dir);
+        chatted(&mut app);
+        app.session_model = Some(READY_MODEL.into());
+        let first = app.session_id.clone();
+        type_line(&mut app, "/clear");
+        assert!(app.conversation.messages().is_empty(), "nothing said");
+        assert_ne!(app.session_id, first);
+        assert_eq!(app.session_model, None);
+        let listed = saved(&dir);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, first);
+        assert_eq!(listed[0].title, "hi");
+
+        app.conversation.push(Message::new(Role::User, "second"));
+        let second = app.session_id.clone();
+        type_line(&mut app, "/new");
+        assert_ne!(app.session_id, second);
+        assert_eq!(load(&dir, &second).title, "second");
+        assert_eq!(saved(&dir).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn sessions_lists_and_enter_resumes_with_the_display_state() {
+        let dir = TempDir::new("session-resume");
+        let (mut app, _backend, _rx) = chat_app(Vec::new());
+        save_in(&mut app, &dir);
+
+        // Session A, with display state to bring back.
+        chatted(&mut app);
+        app.reply_ends.insert(1, ReplyEnd::Empty);
+        let outcome = ToolOutcome {
+            summary: "31 lines".into(),
+            is_error: false,
+        };
+        app.tool_outcomes.insert("c1".into(), outcome);
+        app.tool_previews.insert("c1".into(), "edit a.txt".into());
+        app.tool_outputs
+            .insert("c2".into(), "exit code: 0\nhi".into());
+        app.session_model = Some(READY_MODEL.into());
+        let a = app.session_id.clone();
+        let a_messages = app.conversation.messages().to_vec();
+        let (outcomes, previews, outputs) = (
+            app.tool_outcomes.clone(),
+            app.tool_previews.clone(),
+            app.tool_outputs.clone(),
+        );
+        type_line(&mut app, "/new");
+
+        // Session B, not saved yet.
+        app.conversation.push(Message::new(Role::User, "other"));
+        app.usage = Some(Usage {
+            prompt_tokens: 100,
+            completion_tokens: 10,
+        });
+        app.scroll_up = 5;
+        let b = app.session_id.clone();
+        type_line(&mut app, "/sessions");
+        let Mode::Sessions { entries, selected } = &app.mode else {
+            panic!("not listing: {:?}", app.mode);
+        };
+        let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, [a.as_str()]);
+        assert_eq!(*selected, 0);
+        app.update(key(KeyCode::Down));
+        app.update(key(KeyCode::Enter));
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.session_id, a);
+        let msgs = app.conversation.messages();
+        assert_eq!(msgs[..2], a_messages[..]);
+        assert_eq!(
+            msgs[2],
+            Message::new(Role::Harness, r#"resumed "hi" (2 messages)"#)
+        );
+        assert_eq!(app.reply_ends, HashMap::from([(1, ReplyEnd::Empty)]));
+        assert_eq!(app.tool_outcomes, outcomes);
+        assert_eq!(app.tool_previews, previews);
+        assert_eq!(app.tool_outputs, outputs);
+        assert_eq!(app.usage, None);
+        assert_eq!(app.conversation.token_mark(), None);
+        assert_eq!(app.session_model.as_deref(), Some(READY_MODEL));
+        assert_eq!(app.scroll_up, 0);
+        assert_eq!(load(&dir, &b).title, "other", "B was saved on the way out");
+
+        // Esc closes the list; choosing the current session changes nothing.
+        type_line(&mut app, "/sessions");
+        app.update(key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Normal);
+        type_line(&mut app, "/sessions");
+        let Mode::Sessions { entries, .. } = &app.mode else {
+            panic!("not listing");
+        };
+        assert_eq!(entries.len(), 2);
+        let current = entries.iter().position(|e| e.id == a).unwrap();
+        for _ in 0..current {
+            app.update(key(KeyCode::Down));
+        }
+        let before = app.conversation.messages().len();
+        app.update(key(KeyCode::Enter));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.session_id, a);
+        assert_eq!(app.conversation.messages().len(), before);
+    }
+
+    #[test]
+    fn sessions_says_when_there_is_nothing_to_list() {
+        let mut app = plain_app();
+        type_line(&mut app, "/sessions");
+        assert_eq!(last_said(&app), SESSIONS_OFF_TEXT);
+        let dir = TempDir::new("session-none");
+        save_in(&mut app, &dir);
+        type_line(&mut app, "/sessions");
+        assert_eq!(last_said(&app), NO_SESSIONS_TEXT);
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn resume_opens_the_latest_or_the_named_session() {
+        let dir = TempDir::new("session-resume-flag");
+        let store = SessionStore::in_dir(dir.0.clone());
+        let mut app = plain_app().with_sessions(Some(store.clone()));
+        app.resume(None);
+        assert_eq!(last_said(&app), NO_SESSIONS_TEXT);
+        app.resume(Some("nope"));
+        assert_eq!(last_said(&app), "no session nope");
+
+        for (id, updated, text) in [("100-000", 100, "old"), ("200-000", 200, "new")] {
+            let session = Session {
+                id: id.into(),
+                title: text.into(),
+                model: None,
+                cwd: String::new(),
+                created: updated,
+                updated,
+                messages: vec![Message::new(Role::User, text)],
+                view: serde_json::Value::Null,
+            };
+            store.save(&session).unwrap();
+        }
+        app.resume(None);
+        assert_eq!(app.session_id, "200-000");
+        assert_eq!(last_said(&app), r#"resumed "new" (1 messages)"#);
+        assert!(app.tool_outcomes.is_empty(), "no view, nothing to restore");
+
+        let mut app = plain_app().with_sessions(Some(store));
+        app.resume(Some("100-000"));
+        assert_eq!(app.session_id, "100-000");
+        assert_eq!(app.conversation.messages()[0].content, "old");
+    }
+
+    #[test]
+    fn context_names_the_session() {
+        let mut app = plain_app();
+        type_line(&mut app, "/context");
+        let off = format!(
+            "\nsession: {} (not saved: no home directory)",
+            app.session_id
+        );
+        assert!(last_said(&app).ends_with(&off), "{}", last_said(&app));
+
+        let dir = TempDir::new("session-context");
+        save_in(&mut app, &dir);
+        chatted(&mut app);
+        type_line(&mut app, "/context");
+        // The first `/context` line and the chat.
+        let on = format!(
+            "\nsession: {} (3 messages, {})",
+            app.session_id,
+            dir.0.display()
+        );
+        assert!(last_said(&app).ends_with(&on), "{}", last_said(&app));
     }
 }

@@ -928,6 +928,7 @@ dependencies = [
  "loops-core",
  "ratatui",
  "ratatui-textarea",
+ "serde",
  "serde_json",
  "tokio",
 ]

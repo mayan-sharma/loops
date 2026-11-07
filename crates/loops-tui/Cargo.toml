@@ -13,6 +13,7 @@ loops-core.workspace = true
 anyhow.workspace = true
 crossterm.workspace = true
 futures.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 ratatui.workspace = true
 ratatui-textarea.workspace = true

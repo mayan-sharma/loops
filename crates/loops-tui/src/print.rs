@@ -41,9 +41,12 @@ pub const USAGE: &str = "\
 loops: a coding agent for models served by LM Studio.
 
 Usage:
-  loops                          start the interactive TUI
+  loops [--resume [id]]          start the interactive TUI
   loops --print <prompt> [options]
                                  run one agent turn in the current directory and exit
+
+Options (TUI):
+      --resume [id]        open the latest session of this directory, or <id>
 
 Options (with --print):
   -p, --print <prompt>     the user message; the final answer goes to stdout,
@@ -74,12 +77,24 @@ const COMMAND_CHARS: usize = 100;
 /// What the command line asks for.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
-    /// No arguments: the interactive TUI.
-    Tui,
+    /// No `--print`: the interactive TUI.
+    Tui {
+        /// `--resume`: which saved session to open first, if any.
+        resume: Option<Resume>,
+    },
     /// `--print`: one headless turn.
     Print(PrintArgs),
     /// `--help`: print [`USAGE`].
     Help,
+}
+
+/// Which session `--resume` opens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resume {
+    /// `--resume` alone: the most recently saved session of this directory.
+    Latest,
+    /// `--resume <id>`: that session.
+    Id(String),
 }
 
 /// Options of a headless run.
@@ -102,8 +117,10 @@ pub struct PrintArgs {
 }
 
 /// Parses the arguments after the program name. Options other than `--help`
-/// need `--print`; anything unknown is an error, so a typo in a benchmark
-/// script fails loudly instead of opening the TUI.
+/// and `--resume` need `--print`, and `--resume` is for the TUI only;
+/// anything unknown is an error, so a typo in a benchmark script fails loudly
+/// instead of opening the TUI. `--resume` takes the next argument as its id
+/// unless that starts with `-`.
 pub fn parse(args: &[String]) -> Result<Command> {
     let mut prompt = None;
     let mut max_rounds = DEFAULT_MAX_ROUNDS;
@@ -112,10 +129,11 @@ pub fn parse(args: &[String]) -> Result<Command> {
     let mut model = None;
     let mut thinking = Thinking::Default;
     let mut max_tokens = None;
+    let mut resume = None;
     // The first `--print` option seen, for the error if `--print` is missing.
     let mut option = None;
 
-    let mut args = args.iter();
+    let mut args = args.iter().peekable();
     while let Some(arg) = args.next() {
         let mut value = || {
             args.next()
@@ -136,6 +154,13 @@ pub fn parse(args: &[String]) -> Result<Command> {
                 })?;
             }
             "--max-tokens" => max_tokens = Some(positive(arg, value()?)?),
+            "--resume" => {
+                resume = Some(match args.next_if(|next| !next.starts_with('-')) {
+                    Some(id) => Resume::Id(id.clone()),
+                    None => Resume::Latest,
+                });
+                continue;
+            }
             other => bail!("unknown argument: {other}"),
         }
         if !matches!(arg.as_str(), "-p" | "--print") {
@@ -147,8 +172,11 @@ pub fn parse(args: &[String]) -> Result<Command> {
         if let Some(option) = option {
             bail!("{option} needs --print");
         }
-        return Ok(Command::Tui);
+        return Ok(Command::Tui { resume });
     };
+    if resume.is_some() {
+        bail!("--resume is for the TUI; it cannot be used with --print");
+    }
     if prompt.trim().is_empty() {
         bail!("--print needs a non-empty prompt");
     }
@@ -556,7 +584,33 @@ mod tests {
 
     #[test]
     fn no_arguments_run_the_tui() {
-        assert_eq!(parse_strs(&[]).unwrap(), Command::Tui);
+        assert_eq!(parse_strs(&[]).unwrap(), Command::Tui { resume: None });
+    }
+
+    #[test]
+    fn resume_takes_an_optional_id() {
+        let tui = |resume| Command::Tui {
+            resume: Some(resume),
+        };
+        assert_eq!(parse_strs(&["--resume"]).unwrap(), tui(Resume::Latest));
+        assert_eq!(
+            parse_strs(&["--resume", "1794067200-042"]).unwrap(),
+            tui(Resume::Id("1794067200-042".into()))
+        );
+        // An option after it is not taken as the id.
+        assert_eq!(parse_strs(&["--resume", "-h"]).unwrap(), Command::Help);
+        assert_eq!(
+            parse_error(&["--resume", "--model", "m"]),
+            "--model needs --print"
+        );
+        assert_eq!(parse_error(&["--resume", "a", "b"]), "unknown argument: b");
+    }
+
+    #[test]
+    fn resume_cannot_be_used_with_print() {
+        let error = "--resume is for the TUI; it cannot be used with --print";
+        assert_eq!(parse_error(&["--resume", "-p", "x"]), error);
+        assert_eq!(parse_error(&["-p", "x", "--resume", "abc"]), error);
     }
 
     #[test]

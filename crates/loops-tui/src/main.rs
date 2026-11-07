@@ -18,7 +18,8 @@
 //! loop itself does not change. A turn sends one event per agent event.
 //!
 //! With `--print` none of this runs: [`print`] does one headless turn and
-//! exits, and the terminal is never put in raw mode.
+//! exits, and the terminal is never put in raw mode. With `--resume` the TUI
+//! opens on a saved session (see [`loops_core::session`]).
 
 mod app;
 mod print;
@@ -33,6 +34,7 @@ use loops_core::{
     agent::{Agent, INSTRUCTIONS_FILE, default_system_prompt, environment_with, load_instructions},
     backend::ModelBackend,
     lmstudio::LmStudio,
+    session::SessionStore,
     tools::ToolSet,
 };
 use ratatui::DefaultTerminal;
@@ -48,8 +50,8 @@ const TICK: Duration = Duration::from_millis(250);
 async fn main() -> Result<ExitCode> {
     // Arguments first: only the TUI may touch the terminal's mode.
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match print::parse(&args) {
-        Ok(print::Command::Tui) => {}
+    let resume = match print::parse(&args) {
+        Ok(print::Command::Tui { resume }) => resume,
         Ok(print::Command::Help) => {
             print!("{}", print::USAGE);
             return Ok(ExitCode::SUCCESS);
@@ -70,19 +72,20 @@ async fn main() -> Result<ExitCode> {
             );
             return Ok(ExitCode::from(2));
         }
-    }
+    };
 
     // `init` enables raw mode, enters the alternate screen, and installs a
     // panic hook that restores the terminal before the panic message prints.
     let terminal = ratatui::init();
-    let result = run(terminal).await;
+    let result = run(terminal, resume).await;
     // Restore on every exit path that is not a panic (quit or error).
     ratatui::restore();
     result.map(|()| ExitCode::SUCCESS)
 }
 
-/// Runs the main loop until the app asks to quit.
-async fn run(mut terminal: DefaultTerminal) -> Result<()> {
+/// Runs the main loop until the app asks to quit, first opening the session
+/// `resume` names, if any.
+async fn run(mut terminal: DefaultTerminal, resume: Option<print::Resume>) -> Result<()> {
     let (tx, mut rx) = mpsc::channel(256);
     let mut reader = tokio::spawn(forward_terminal_events(tx.clone()));
 
@@ -123,9 +126,15 @@ async fn run(mut terminal: DefaultTerminal) -> Result<()> {
     let agent =
         Agent::new(backend, tools, Some(default_system_prompt())).with_environment(environment);
 
-    let mut app = App::new(Arc::new(agent), tx, cwd);
+    let store = SessionStore::for_project(&cwd);
+    let mut app = App::new(Arc::new(agent), tx, cwd).with_sessions(store);
     app.instructions =
         instructions.map(|(_, described)| format!("{INSTRUCTIONS_FILE}, {described}"));
+    match resume {
+        Some(print::Resume::Latest) => app.resume(None),
+        Some(print::Resume::Id(id)) => app.resume(Some(&id)),
+        None => {}
+    }
     while !app.should_quit {
         terminal.draw(|frame| ui::draw(frame, &app))?;
 

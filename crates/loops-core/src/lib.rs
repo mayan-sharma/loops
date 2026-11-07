@@ -3,16 +3,19 @@
 //! The in-memory conversation model lives here; LM Studio control is in
 //! [`lmstudio`], behind the [`backend::ModelBackend`] seam, and streamed chat
 //! parsing is in [`chat`]. The agent loop is in [`agent`], and the tools it can
-//! run are in [`tools`].
+//! run are in [`tools`]. Saved conversations are in [`session`].
+
+use serde::{Deserialize, Serialize};
 
 pub mod agent;
 pub mod backend;
 pub mod chat;
 pub mod lmstudio;
+pub mod session;
 pub mod tools;
 
 /// Who authored a message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Role {
     /// The person typing at the keyboard.
     User,
@@ -27,7 +30,7 @@ pub enum Role {
 }
 
 /// A tool the model asked to run.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCall {
     /// Pairs the call with its result ([`Message::tool_call_id`]).
     pub id: String,
@@ -38,7 +41,7 @@ pub struct ToolCall {
 }
 
 /// One turn in a conversation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
     /// Author of the message.
     pub role: Role,

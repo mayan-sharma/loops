@@ -12,6 +12,7 @@ use loops_core::{
     Message, Role, ToolCall,
     agent::{DECLINED, DECLINED_NOBODY_TO_ASK},
     lmstudio::{ModelInfo, ModelState},
+    session::{SessionSummary, relative_time, unix_now},
 };
 use ratatui::{
     Frame,
@@ -62,8 +63,8 @@ const INDENT: &str = "  ";
 
 /// Draws one full frame: the transcript (under the banner while the chat is
 /// new), the input box, or the permission prompt in its place while one is
-/// open, and the status bar on the bottom row. The model picker is drawn on
-/// top of the transcript when it is open.
+/// open, and the status bar on the bottom row. The model picker and the
+/// session list are drawn on top of the transcript when open.
 pub fn draw(frame: &mut Frame, app: &App) {
     let bottom_height = match app.mode {
         Mode::Permission { .. } => PERMISSION_HEIGHT,
@@ -87,6 +88,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Mode::Picker { models, selected } => {
             draw_input(frame, bottom, app);
             draw_picker(frame, transcript, models, *selected);
+        }
+        Mode::Sessions { entries, selected } => {
+            draw_input(frame, bottom, app);
+            draw_sessions(frame, transcript, entries, *selected, unix_now());
         }
         Mode::Confirm { models, selected } => {
             draw_input(frame, bottom, app);
@@ -674,6 +679,63 @@ fn draw_picker(frame: &mut Frame, area: Rect, models: &[ModelInfo], selected: us
     frame.render_widget(block, popup);
     frame.render_widget(header, header_row);
     frame.render_stateful_widget(list, list_area, &mut state);
+}
+
+/// The `/sessions` popup: one row per saved session, newest first, as
+/// `<title>  <how long ago>  <n> messages` in aligned columns (the last two
+/// dim), the selected row reversed. `now` is the time ages are measured from.
+fn draw_sessions(
+    frame: &mut Frame,
+    area: Rect,
+    entries: &[SessionSummary],
+    selected: usize,
+    now: u64,
+) {
+    let titles: Vec<&str> = entries
+        .iter()
+        .map(|e| {
+            if e.title.is_empty() {
+                "(untitled)"
+            } else {
+                e.title.as_str()
+            }
+        })
+        .collect();
+    let ages: Vec<String> = entries
+        .iter()
+        .map(|e| relative_time(e.updated, now))
+        .collect();
+    let title_width = titles.iter().map(|t| t.chars().count()).max().unwrap_or(0);
+    let age_width = ages.iter().map(String::len).max().unwrap_or(0);
+    let rows: Vec<Line> = entries
+        .iter()
+        .zip(titles.iter().zip(&ages))
+        .map(|(entry, (title, age))| {
+            let count = match entry.messages {
+                1 => "1 message".to_owned(),
+                n => format!("{n} messages"),
+            };
+            Line::from(vec![
+                Span::raw(format!(" {title:<title_width$}  ")),
+                Span::styled(format!("{age:>age_width$}  {count} "), Style::new().dim()),
+            ])
+        })
+        .collect();
+
+    let content_width = rows
+        .iter()
+        .map(Line::width)
+        .chain([PICKER_HINT.chars().count()])
+        .max()
+        .unwrap_or(0);
+    let popup = centered(area, content_width + 2, rows.len() + 2);
+    let block = rounded()
+        .title(" resume a session ")
+        .title_bottom(PICKER_HINT.dim());
+    let list = List::new(rows.into_iter().map(ListItem::new)).highlight_style(HIGHLIGHT);
+    let mut state = ListState::default().with_selected(Some(selected));
+    frame.render_widget(Clear, popup);
+    frame.render_stateful_widget(list.block(block), popup, &mut state);
 }
 
 /// The `Load <id>? (y/n)` popup.
@@ -1706,6 +1768,45 @@ mod tests {
             "selected row is highlighted"
         );
         assert!(!reversed("qwen/qwen3.5-9b"), "other rows are not");
+    }
+
+    #[test]
+    fn sessions_list_titles_ages_and_highlights_the_selection() {
+        let mut app = plain_app();
+        let now = unix_now();
+        let entry = |id: &str, title: &str, ago: u64, messages: usize| SessionSummary {
+            id: id.into(),
+            title: title.into(),
+            updated: now - ago,
+            messages,
+        };
+        app.mode = Mode::Sessions {
+            entries: vec![
+                entry("3", "fix the parser", 10, 4),
+                entry("2", "", 7_200, 1),
+                entry("1", "add a --resume flag", 3 * 86_400, 12),
+            ],
+            selected: 1,
+        };
+        let buffer = render_buffer(&app, 70, 12);
+        let rows = rows(&buffer);
+        let screen = rows.join("\n");
+        assert!(screen.contains("resume a session"));
+        assert!(screen.contains("Enter select"), "the picker's footer");
+
+        let row = |text: &str| rows.iter().find(|r| r.contains(text)).unwrap().clone();
+        assert!(
+            row("fix the parser").contains("fix the parser       just now  4 messages"),
+            "{}",
+            row("fix the parser")
+        );
+        assert!(row("(untitled)").contains("2 h ago  1 message "));
+        assert!(row("add a --resume").contains("3 d ago  12 messages"));
+        assert!(is_dim(cell_at(&buffer, "3 d ago")));
+
+        let reversed = |text: &str| cell_at(&buffer, text).modifier.contains(Modifier::REVERSED);
+        assert!(reversed("(untitled)"), "selected row is highlighted");
+        assert!(!reversed("fix the parser"), "other rows are not");
     }
 
     #[test]
