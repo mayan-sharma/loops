@@ -21,6 +21,24 @@
 //! [`permission_scope`](crate::tools::Tool::permission_scope), so a front end
 //! that remembers "don't ask again" knows what the yes covers: a whole file
 //! tool, or one exact `bash` command.
+//!
+//! # Context control
+//!
+//! Before each request the agent estimates how full the model's context window
+//! will be ([`Conversation::estimated_tokens`], anchored on the server's last
+//! token count) and stops the turn with a clear message when there is no room
+//! left for a reply, instead of sending a request the server would refuse. The
+//! room that is left caps the reply (`max_tokens`). A reply that hits that cap
+//! (`finish_reason: "length"`) is continued, not taken as the answer: the
+//! model is shown what it wrote so far and asked to go on, up to
+//! [`MAX_CONTINUATIONS`] times.
+//!
+//! # Compaction
+//!
+//! When the window is nearly full, [`Agent::compact`] asks the model to
+//! summarise the conversation for itself and replaces every message with that
+//! summary, so the work can go on in a window that has room again. It runs
+//! only when the front end asks for it (`/compact`), never on its own.
 
 use std::{path::Path, sync::Arc};
 
@@ -30,12 +48,51 @@ use tokio::sync::mpsc;
 use crate::{
     Conversation, Message, Role, ToolCall,
     backend::ModelBackend,
-    chat::{ChatDelta, ToolCallAssembler},
+    chat::{ChatDelta, RequestOptions, Thinking, ToolCallAssembler, to_openai_tools},
+    estimate_tokens,
     tools::{ToolSet, ToolSpec},
 };
 
 /// Rounds allowed in one turn before the agent gives up.
 pub const DEFAULT_MAX_ITERATIONS: usize = 20;
+
+/// Fewest tokens a reply must have room for; with less left in the window the
+/// turn stops before sending.
+pub const MIN_REPLY_TOKENS: u64 = 256;
+
+/// How many times one reply cut off at the output limit is continued before
+/// the turn gives up.
+pub const MAX_CONTINUATIONS: u32 = 2;
+
+/// What the model is told when its reply was cut off. Sent only in the
+/// continuation request, never stored in the conversation.
+const CONTINUE_NUDGE: &str = "Your reply was cut off at the output limit. Continue from exactly where you stopped; do not repeat what you already wrote.";
+
+/// What the server says when the prompt does not fit the loaded window.
+const SERVER_CONTEXT_FULL: &str = "exceeds the available context size";
+
+/// What a turn that finds the window full advises.
+const FULL_ADVICE: &str = "/compact to shrink it or /clear to start over";
+
+/// What the model is asked by [`Agent::compact`]. Sent only in that request,
+/// never stored in the conversation.
+pub const COMPACT_INSTRUCTION: &str = "Summarise this conversation for yourself, so you can continue the work after the earlier messages are removed. Include: the user's goal; what has been done, with file paths and the exact changes made; what was learned from tool results and errors; what is still open or was declined; and any preferences or instructions the user gave. Be specific and compact. Plain text, no preamble.";
+
+/// Most tokens the summary written by [`Agent::compact`] may use.
+pub const COMPACT_MAX_TOKENS: u64 = 1024;
+
+/// Fewest tokens the summary must have room for; with less left in the window
+/// [`Agent::compact`] stops before sending.
+pub const COMPACT_MIN_ROOM: u64 = 128;
+
+/// What the summary is introduced with in the compacted conversation.
+const SUMMARY_PREFIX: &str =
+    "Summary of the conversation so far, written to continue after earlier messages were removed:";
+
+/// The model's side of the compacted conversation, after the summary. It keeps
+/// the next user message from following the summary directly, since some chat
+/// templates merge user messages that run back to back.
+const SUMMARY_ACKNOWLEDGEMENT: &str = "Understood. Continuing from that summary.";
 
 /// [`AgentEvent::ToolFinished`] summary of a call the user declined.
 pub const DECLINED: &str = "declined";
@@ -101,6 +158,9 @@ pub enum AgentEvent {
         /// Whether the tool failed or was declined (the model still sees why
         /// as the result).
         is_error: bool,
+        /// The whole result the model reads: the tool's output, `error: …`
+        /// for a failure, or the refusal text for a declined call.
+        output: String,
     },
     /// Tokens a request used (once per round, after its stream ends). The
     /// prompt holds the whole conversation as sent, so the last of these says
@@ -110,6 +170,14 @@ pub enum AgentEvent {
         prompt_tokens: u64,
         /// What it wrote, thinking included.
         completion_tokens: u64,
+    },
+    /// The reply stopped at the output limit; the agent is asking the model
+    /// to continue it. Its text so far stays: the continuation is appended.
+    ReplyCutOff {
+        /// Which continuation this is, from 1.
+        attempt: u32,
+        /// Continuations allowed ([`MAX_CONTINUATIONS`]).
+        max: u32,
     },
     /// The model answered in text; the turn is over.
     TurnDone,
@@ -133,11 +201,40 @@ pub struct Agent {
     pub max_iterations: usize,
 }
 
+/// Limits for one turn, set by the front end.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TurnOptions {
+    /// The loaded model's context window in tokens, if known. When set, each
+    /// request is checked to fit and its reply is capped to the room left.
+    pub context_length: Option<u64>,
+    /// Most tokens one reply may use, thinking included; `None` for no cap
+    /// beyond the room left in the window.
+    pub max_output_tokens: Option<u64>,
+    /// How much the model may think.
+    pub thinking: Thinking,
+}
+
+/// What [`Agent::compact`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactReport {
+    /// About how many tokens the old conversation held: the server's count
+    /// where there was one ([`Conversation::estimated_tokens`] with no overhead).
+    pub before: u64,
+    /// About how many the compacted conversation holds, guessed from its text.
+    pub after: u64,
+    /// What the model wrote.
+    pub summary: String,
+}
+
 /// What the model said in one round.
 #[derive(Debug, Default)]
 struct Reply {
     text: String,
     calls: Vec<ToolCall>,
+    /// Why generation stopped, from the first `Done` that said.
+    finish_reason: Option<String>,
+    /// Prompt plus completion tokens, if the server reported usage.
+    tokens: Option<u64>,
 }
 
 /// Whether a tool call may run.
@@ -182,20 +279,38 @@ impl Agent {
     /// are asked one at a time, in order. If `decisions` is closed there is
     /// nobody to ask, and the call is declined.
     ///
+    /// `options` bounds every request of the turn (see the module docs on
+    /// context control). After each round the conversation's token mark is
+    /// set from the server's usage, so the next estimate starts from a real count.
+    ///
     /// To cancel, drop the future (abort its task), also while it waits for a
     /// decision. `conversation` stays valid to send again: a round is appended
     /// only once all its tools have run (or been declined), so an interrupted
-    /// round leaves nothing, never a tool call without its result.
+    /// round leaves nothing, never a tool call without its result. A reply
+    /// being continued after a cut-off is not stored until it finishes either.
     pub async fn run_turn(
         &self,
         model: &str,
         conversation: &mut Conversation,
         sink: mpsc::Sender<AgentEvent>,
         mut decisions: mpsc::Receiver<Decision>,
+        options: &TurnOptions,
     ) -> Result<()> {
+        let mut carry = String::new();
         let result = self
-            .run_rounds(model, conversation, &sink, &mut decisions)
+            .run_rounds(
+                model,
+                conversation,
+                &sink,
+                &mut decisions,
+                options,
+                &mut carry,
+            )
             .await;
+        // A failed turn keeps the text of a reply it was still continuing.
+        if result.is_err() && !carry.is_empty() {
+            conversation.push(Message::new(Role::Assistant, carry));
+        }
         let last = match &result {
             Ok(()) => AgentEvent::TurnDone,
             Err(err) => AgentEvent::TurnFailed(format!("{err:#}")),
@@ -204,26 +319,131 @@ impl Agent {
         result
     }
 
-    /// The loop itself.
+    /// Replaces `conversation` with a summary the model writes of it: a user
+    /// message holding the summary, then a short assistant acknowledgement.
+    ///
+    /// The request carries only the conversation and [`COMPACT_INSTRUCTION`]:
+    /// no system prompt, environment or tools, and thinking off. With a known
+    /// window the summary is capped to the room left (at most
+    /// [`COMPACT_MAX_TOKENS`]), and nothing is sent when less than
+    /// [`COMPACT_MIN_ROOM`] is left. A summary cut off at that cap is kept as
+    /// it is, just shorter.
+    ///
+    /// Fails, leaving `conversation` unchanged, when it holds nothing the user
+    /// or the model said, when it is too full, when the request fails, or when
+    /// the summary is empty. To cancel, drop the future; the conversation is
+    /// only replaced once the summary is complete.
+    pub async fn compact(
+        &self,
+        model: &str,
+        conversation: &mut Conversation,
+        options: &TurnOptions,
+    ) -> Result<CompactReport> {
+        let said = |m: &Message| matches!(m.role, Role::User | Role::Assistant);
+        if !conversation.messages().iter().any(said) {
+            bail!("nothing to compact");
+        }
+        let before = conversation.estimated_tokens(0);
+        // With a token mark the estimate holds the system prompt and tools
+        // instead of the instruction, which more than covers it.
+        let instruction = estimate_tokens(COMPACT_INSTRUCTION.chars().count());
+        let max_tokens = match options.context_length {
+            Some(window) => {
+                let used = conversation.estimated_tokens(instruction);
+                if used + COMPACT_MIN_ROOM > window {
+                    bail!(
+                        "too full to compact: about {used} of {window} tokens used; /clear to start over"
+                    );
+                }
+                COMPACT_MAX_TOKENS.min(window - used)
+            }
+            None => COMPACT_MAX_TOKENS,
+        };
+        let request = RequestOptions {
+            max_tokens: Some(max_tokens),
+            thinking: Thinking::Off,
+        };
+        let mut messages = conversation.messages().to_vec();
+        messages.push(Message::new(Role::User, COMPACT_INSTRUCTION));
+
+        let (tx, mut deltas) = mpsc::channel(64);
+        let collect = async {
+            let mut summary = String::new();
+            while let Some(delta) = deltas.recv().await {
+                // Thinking, tool calls (none were offered) and usage are ignored.
+                if let ChatDelta::Content(text) = delta {
+                    summary.push_str(&text);
+                }
+            }
+            summary
+        };
+        // `chat` owns `tx` and drops it when it returns, which ends `collect`.
+        let (result, summary) = tokio::join!(
+            self.backend.chat(model, &messages, &[], &request, tx),
+            collect
+        );
+        result.map_err(|err| context_full(err, "/clear to start over"))?;
+        let summary = summary.trim();
+        if summary.is_empty() {
+            bail!("the model returned an empty summary");
+        }
+
+        conversation.replace_all(vec![
+            Message::new(Role::User, format!("{SUMMARY_PREFIX}\n\n{summary}")),
+            Message::new(Role::Assistant, SUMMARY_ACKNOWLEDGEMENT),
+        ]);
+        Ok(CompactReport {
+            before,
+            after: conversation.estimated_tokens(0),
+            summary: summary.to_owned(),
+        })
+    }
+
+    /// The loop itself. `carry` holds the text of a reply cut off at the
+    /// output limit while it is being continued; `run_turn` stores it if the
+    /// turn fails before the reply finishes.
     async fn run_rounds(
         &self,
         model: &str,
         conversation: &mut Conversation,
         sink: &mpsc::Sender<AgentEvent>,
         decisions: &mut mpsc::Receiver<Decision>,
+        options: &TurnOptions,
+        carry: &mut String,
     ) -> Result<()> {
         let specs = self.tools.specs();
+        let overhead = self.overhead(&specs);
+        let mut cut_offs = 0;
         for _ in 0..self.max_iterations {
-            let (result, reply) = self.ask_model(model, conversation, &specs, sink).await;
+            let request = request_options(conversation, carry, overhead, options)?;
+            let sent = conversation.messages().len();
+            let (result, reply) = self
+                .ask_model(model, conversation, carry, &specs, &request, sink)
+                .await;
             if let Err(err) = result {
                 // Keep whatever text arrived; tool calls are dropped since they never ran.
-                if !reply.text.is_empty() {
-                    conversation.push(Message::new(Role::Assistant, reply.text));
-                }
-                return Err(err);
+                carry.push_str(&reply.text);
+                return Err(context_full(err, FULL_ADVICE));
             }
+            if reply.finish_reason.as_deref() == Some("length") {
+                // Tool calls of a cut-off reply may be truncated, so none run.
+                carry.push_str(&reply.text);
+                cut_offs += 1;
+                if cut_offs > MAX_CONTINUATIONS {
+                    bail!("reply cut off at the output limit {cut_offs} times");
+                }
+                let cut_off = AgentEvent::ReplyCutOff {
+                    attempt: cut_offs,
+                    max: MAX_CONTINUATIONS,
+                };
+                emit(sink, cut_off).await;
+                continue;
+            }
+            let text = std::mem::take(carry) + &reply.text;
+            cut_offs = 0;
             if reply.calls.is_empty() {
-                conversation.push(Message::new(Role::Assistant, reply.text));
+                conversation.push(Message::new(Role::Assistant, text));
+                mark(conversation, sent, reply.tokens);
                 return Ok(());
             }
 
@@ -232,7 +452,8 @@ impl Agent {
                 results.push(self.run_tool(call, sink, decisions).await);
             }
             // The request and its results go in together (see `run_turn`).
-            conversation.push(Message::assistant_with_tool_calls(reply.text, reply.calls));
+            conversation.push(Message::assistant_with_tool_calls(text, reply.calls));
+            mark(conversation, sent, reply.tokens);
             for result in results {
                 conversation.push(result);
             }
@@ -240,14 +461,33 @@ impl Agent {
         bail!("stopped after {} tool rounds", self.max_iterations)
     }
 
+    /// A characters/4 guess at what every request carries besides the
+    /// conversation: the system prompt, the environment block and the tool
+    /// specs. Used only until the server has counted a request.
+    fn overhead(&self, specs: &[ToolSpec]) -> u64 {
+        let chars = |text: &Option<String>| text.as_deref().map_or(0, |t| t.chars().count());
+        let tools = if specs.is_empty() {
+            0
+        } else {
+            to_openai_tools(specs).to_string().chars().count()
+        };
+        estimate_tokens(chars(&self.system_prompt) + chars(&self.environment) + tools)
+    }
+
     /// Streams one model reply, forwarding text and thinking to `sink` as it
     /// arrives. Returns the backend's result together with everything that
     /// arrived, so text before a failure is not lost.
+    ///
+    /// When `carry` holds a reply cut off at the output limit, the request ends
+    /// with it as an assistant message and a user message asking the model to
+    /// continue; neither is stored.
     async fn ask_model(
         &self,
         model: &str,
         conversation: &Conversation,
+        carry: &str,
         specs: &[ToolSpec],
+        options: &RequestOptions,
         sink: &mpsc::Sender<AgentEvent>,
     ) -> (Result<()>, Reply) {
         let mut messages = Vec::new();
@@ -255,6 +495,10 @@ impl Agent {
             messages.push(Message::new(Role::System, prompt.clone()));
         }
         messages.extend_from_slice(conversation.messages());
+        if !carry.is_empty() {
+            messages.push(Message::new(Role::Assistant, carry));
+            messages.push(Message::new(Role::User, CONTINUE_NUDGE));
+        }
         if let Some(environment) = &self.environment
             && let Some(first_user) = messages.iter_mut().find(|m| m.role == Role::User)
         {
@@ -279,11 +523,15 @@ impl Agent {
                         thinking = true;
                         emit(sink, AgentEvent::Thinking).await;
                     }
-                    ChatDelta::Reasoning(_) | ChatDelta::Done { .. } => {}
+                    ChatDelta::Reasoning(_) => {}
+                    ChatDelta::Done { finish_reason } => {
+                        reply.finish_reason = reply.finish_reason.or(finish_reason);
+                    }
                     ChatDelta::Usage {
                         prompt_tokens,
                         completion_tokens,
                     } => {
+                        reply.tokens = Some(prompt_tokens + completion_tokens);
                         let usage = AgentEvent::Usage {
                             prompt_tokens,
                             completion_tokens,
@@ -302,7 +550,10 @@ impl Agent {
             reply
         };
         // `chat` owns `tx` and drops it when it returns, which ends `collect`.
-        tokio::join!(self.backend.chat(model, &messages, specs, tx), collect)
+        tokio::join!(
+            self.backend.chat(model, &messages, specs, options, tx),
+            collect
+        )
     }
 
     /// Runs one tool call, after asking if it changes things, and returns its
@@ -342,6 +593,7 @@ impl Agent {
                 name: call.name.clone(),
                 summary,
                 is_error,
+                output: output.clone(),
             },
         )
         .await;
@@ -383,6 +635,64 @@ impl Agent {
             Some(Decision::Deny) => Verdict::Decline(DECLINED),
             None => Verdict::Decline(DECLINED_NOBODY_TO_ASK),
         }
+    }
+}
+
+/// The limits of the next request: stops the turn if the window has no room
+/// for a reply, else caps the reply to the room left (and to
+/// `options.max_output_tokens`). The estimate is the conversation's
+/// ([`Conversation::estimated_tokens`]) plus, while a cut-off reply is being
+/// continued, a guess for its text and the nudge sent with it.
+fn request_options(
+    conversation: &Conversation,
+    carry: &str,
+    overhead: u64,
+    options: &TurnOptions,
+) -> Result<RequestOptions> {
+    let max_tokens = match options.context_length {
+        Some(window) => {
+            let mut used = conversation.estimated_tokens(overhead);
+            if !carry.is_empty() {
+                used += estimate_tokens(carry.chars().count() + CONTINUE_NUDGE.len());
+            }
+            if used + MIN_REPLY_TOKENS > window {
+                bail!("context full: about {used} of {window} tokens used; {FULL_ADVICE}");
+            }
+            Some(
+                options
+                    .max_output_tokens
+                    .unwrap_or(u64::MAX)
+                    .min(window - used),
+            )
+        }
+        None => options.max_output_tokens,
+    };
+    Ok(RequestOptions {
+        max_tokens,
+        thinking: options.thinking,
+    })
+}
+
+/// Sets the token mark after a round whose request carried the first `sent`
+/// messages and whose reply is now message `sent`. Without usage the old mark
+/// stays and the estimate guesses the rest.
+///
+/// After a continued reply the count also holds the nudge that asked for the
+/// rest, so it is a few tokens high, which errs on the safe side.
+fn mark(conversation: &mut Conversation, sent: usize, tokens: Option<u64>) {
+    if let Some(tokens) = tokens {
+        conversation.set_token_mark(sent + 1, tokens);
+    }
+}
+
+/// Turns the server's refusal of a prompt larger than the window into the
+/// same `advice` the agent's own check gives; other errors pass unchanged.
+fn context_full(err: anyhow::Error, advice: &str) -> anyhow::Error {
+    let text = format!("{err:#}");
+    if text.contains(SERVER_CONTEXT_FULL) {
+        anyhow::anyhow!("context full: the server refused the request ({text}); {advice}")
+    } else {
+        err
     }
 }
 
@@ -453,6 +763,8 @@ mod tests {
         fail: Option<&'static str>,
         /// Messages and tool count of each request, in order.
         requests: Mutex<Vec<(Vec<Message>, usize)>>,
+        /// The options of each request, in order.
+        options: Mutex<Vec<RequestOptions>>,
     }
 
     impl ModelBackend for Scripted {
@@ -477,11 +789,13 @@ mod tests {
             _model: &'a str,
             messages: &'a [Message],
             tools: &'a [ToolSpec],
+            options: &'a RequestOptions,
             sink: mpsc::Sender<ChatDelta>,
         ) -> BoxFuture<'a, Result<()>> {
             let mut requests = self.requests.lock().unwrap();
             let round = self.rounds[requests.len().min(self.rounds.len() - 1)].clone();
             requests.push((messages.to_vec(), tools.len()));
+            self.options.lock().unwrap().push(options.clone());
             Box::pin(async move {
                 for delta in round {
                     let _ = sink.send(delta).await;
@@ -548,13 +862,451 @@ mod tests {
         conversation.push(Message::new(Role::User, prompt));
         let (tx, mut rx) = mpsc::channel(256);
         let result = agent
-            .run_turn("m", &mut conversation, tx, answers(decisions))
+            .run_turn(
+                "m",
+                &mut conversation,
+                tx,
+                answers(decisions),
+                &TurnOptions::default(),
+            )
             .await;
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
             events.push(event);
         }
         (result, conversation, events)
+    }
+
+    /// Runs one turn on `conversation` under `options`, with nobody to ask;
+    /// returns the result and every event sent.
+    async fn turn_with(
+        agent: &Agent,
+        conversation: &mut Conversation,
+        options: &TurnOptions,
+    ) -> (Result<()>, Vec<AgentEvent>) {
+        let (tx, mut rx) = mpsc::channel(256);
+        let result = agent
+            .run_turn("m", conversation, tx, answers(&[]), options)
+            .await;
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        (result, events)
+    }
+
+    /// A conversation of one user message the server already counted as
+    /// `tokens` tokens, so the next estimate is exactly that.
+    fn counted(tokens: u64) -> Conversation {
+        let mut conversation = Conversation::new();
+        conversation.push(Message::new(Role::User, "go"));
+        conversation.set_token_mark(1, tokens);
+        conversation
+    }
+
+    fn done(reason: &str) -> ChatDelta {
+        ChatDelta::Done {
+            finish_reason: Some(reason.into()),
+        }
+    }
+
+    fn usage(prompt_tokens: u64, completion_tokens: u64) -> ChatDelta {
+        ChatDelta::Usage {
+            prompt_tokens,
+            completion_tokens,
+        }
+    }
+
+    /// A model that answers `ok`.
+    fn says_ok() -> Arc<Scripted> {
+        Arc::new(Scripted {
+            rounds: vec![vec![text("ok"), done("stop")]],
+            ..Scripted::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn thinking_and_the_reply_cap_reach_the_backend() {
+        let backend = says_ok();
+        let agent = agent(backend.clone());
+        let cases = [
+            // No window: only the cap the user set.
+            (None, Some(300), Thinking::Off, Some(300)),
+            (None, None, Thinking::High, None),
+            // A window: the room left, or the user's cap if smaller.
+            (Some(10_000), None, Thinking::Default, Some(9_000)),
+            (Some(10_000), Some(500), Thinking::Low, Some(500)),
+        ];
+        for (context_length, max_output_tokens, thinking, _) in cases {
+            let options = TurnOptions {
+                context_length,
+                max_output_tokens,
+                thinking,
+            };
+            turn_with(&agent, &mut counted(1000), &options)
+                .await
+                .0
+                .unwrap();
+        }
+        let sent = backend.options.lock().unwrap();
+        let expected: Vec<RequestOptions> = cases
+            .iter()
+            .map(|&(_, _, thinking, max_tokens)| RequestOptions {
+                max_tokens,
+                thinking,
+            })
+            .collect();
+        assert_eq!(*sent, expected);
+    }
+
+    #[tokio::test]
+    async fn a_full_window_stops_the_turn_before_any_request() {
+        let backend = says_ok();
+        let options = TurnOptions {
+            context_length: Some(8192),
+            ..TurnOptions::default()
+        };
+        let mut conversation = counted(7_937);
+        let (result, events) =
+            turn_with(&agent(backend.clone()), &mut conversation, &options).await;
+        let error = "context full: about 7937 of 8192 tokens used; /compact to shrink it or /clear to start over";
+        assert_eq!(result.unwrap_err().to_string(), error);
+        assert_eq!(events, [AgentEvent::TurnFailed(error.into())]);
+        assert!(backend.requests.lock().unwrap().is_empty(), "nothing sent");
+        assert_eq!(conversation.messages().len(), 1);
+
+        // One token less leaves exactly the minimum reply room.
+        let mut conversation = counted(7_936);
+        let (result, _) = turn_with(&agent(backend.clone()), &mut conversation, &options).await;
+        result.unwrap();
+        assert_eq!(
+            backend.options.lock().unwrap()[0].max_tokens,
+            Some(MIN_REPLY_TOKENS)
+        );
+    }
+
+    /// Each round's usage marks the conversation, and the next request's
+    /// estimate starts from that count plus a guess for the tool result.
+    #[tokio::test]
+    async fn usage_marks_the_conversation_and_anchors_the_next_estimate() {
+        let backend = Arc::new(Scripted {
+            rounds: vec![
+                vec![
+                    call("c", "list_files", ""),
+                    done("tool_calls"),
+                    usage(100, 10),
+                ],
+                vec![text("ok"), done("stop"), usage(150, 2)],
+            ],
+            ..Scripted::default()
+        });
+        let options = TurnOptions {
+            context_length: Some(100_000),
+            ..TurnOptions::default()
+        };
+        let mut conversation = Conversation::new();
+        conversation.push(Message::new(Role::User, "look"));
+        let (result, _) = turn_with(&agent(backend.clone()), &mut conversation, &options).await;
+        result.unwrap();
+
+        let msgs = conversation.messages();
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(conversation.token_mark(), Some((4, 152)));
+        let tool_result = (msgs[2].content.chars().count() as u64).div_ceil(4);
+        let sent = backend.options.lock().unwrap();
+        assert_eq!(sent[1].max_tokens, Some(100_000 - (110 + tool_result)));
+    }
+
+    #[tokio::test]
+    async fn a_cut_off_reply_is_continued_and_stored_whole() {
+        let backend = Arc::new(Scripted {
+            rounds: vec![
+                vec![text("Hello, "), done("length")],
+                vec![text("world."), done("stop")],
+            ],
+            ..Scripted::default()
+        });
+        let (result, conversation, events) = turn(&agent(backend.clone()), "greet").await;
+        result.unwrap();
+
+        assert_eq!(
+            conversation.messages(),
+            [
+                Message::new(Role::User, "greet"),
+                Message::new(Role::Assistant, "Hello, world."),
+            ]
+        );
+        let cut_offs: Vec<&AgentEvent> = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ReplyCutOff { .. }))
+            .collect();
+        assert_eq!(
+            cut_offs,
+            [&AgentEvent::ReplyCutOff {
+                attempt: 1,
+                max: MAX_CONTINUATIONS
+            }]
+        );
+
+        let requests = backend.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let (second, _) = &requests[1];
+        assert_eq!(
+            second[second.len() - 2..],
+            [
+                Message::new(Role::Assistant, "Hello, "),
+                Message::new(Role::User, CONTINUE_NUDGE),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reply_cut_off_too_often_fails_and_keeps_its_text() {
+        let backend = Arc::new(Scripted {
+            rounds: vec![vec![text("ab"), done("length")]],
+            ..Scripted::default()
+        });
+        let (result, conversation, events) = turn(&agent(backend.clone()), "go").await;
+        let error = "reply cut off at the output limit 3 times";
+        assert_eq!(result.unwrap_err().to_string(), error);
+        assert_eq!(
+            conversation.messages()[1..],
+            [Message::new(Role::Assistant, "ababab")]
+        );
+        let tail: Vec<&AgentEvent> = events
+            .iter()
+            .filter(|e| !matches!(e, AgentEvent::Text(_)))
+            .collect();
+        assert_eq!(
+            tail,
+            [
+                &AgentEvent::ReplyCutOff { attempt: 1, max: 2 },
+                &AgentEvent::ReplyCutOff { attempt: 2, max: 2 },
+                &AgentEvent::TurnFailed(error.into()),
+            ]
+        );
+        assert_eq!(backend.requests.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn tool_calls_of_a_cut_off_reply_are_not_run() {
+        let backend = Arc::new(Scripted {
+            rounds: vec![
+                vec![
+                    text("let me "),
+                    call("c", "list_files", "{\"pa"),
+                    done("length"),
+                ],
+                vec![text("look."), done("stop")],
+            ],
+            ..Scripted::default()
+        });
+        let (result, conversation, events) = turn(&agent(backend), "go").await;
+        result.unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolStarted { .. }))
+        );
+        assert_eq!(
+            conversation.messages()[1..],
+            [Message::new(Role::Assistant, "let me look.")]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_server_refusing_a_full_window_says_context_full() {
+        let backend = Arc::new(Scripted {
+            rounds: vec![Vec::new()],
+            fail: Some(
+                "POST /v1/chat/completions returned 400 Bad Request: \
+                 {\"error\":\"the request exceeds the available context size\"}",
+            ),
+            ..Scripted::default()
+        });
+        let (result, _, _) = turn(&agent(backend), "go").await;
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.starts_with("context full: the server refused the request (POST "),
+            "{error}"
+        );
+        assert!(
+            error.ends_with("context size\"}); /compact to shrink it or /clear to start over"),
+            "{error}"
+        );
+    }
+
+    /// Compacts `conversation` with a model that replies `round`; returns the
+    /// result and the backend, for what it was sent.
+    async fn compact_with(
+        round: Vec<ChatDelta>,
+        conversation: &mut Conversation,
+        context_length: Option<u64>,
+    ) -> (Result<CompactReport>, Arc<Scripted>) {
+        let backend = Arc::new(Scripted {
+            rounds: vec![round],
+            ..Scripted::default()
+        });
+        let agent = agent(backend.clone()).with_environment("working directory: /w");
+        let options = TurnOptions {
+            context_length,
+            // Neither applies to the summary.
+            max_output_tokens: Some(50),
+            thinking: Thinking::High,
+        };
+        let result = agent.compact("m", conversation, &options).await;
+        (result, backend)
+    }
+
+    /// A conversation with a tool round and a harness line, the first four
+    /// messages counted by the server as 2,000 tokens.
+    fn worked_on() -> Conversation {
+        let mut conversation = Conversation::new();
+        conversation.push(Message::new(Role::User, "fix the typo"));
+        let read = ToolCall {
+            id: "c1".into(),
+            name: "read_file".into(),
+            arguments: r#"{"path":"a.txt"}"#.into(),
+        };
+        conversation.push(Message::assistant_with_tool_calls("", vec![read]));
+        conversation.push(Message::tool_result("c1", "1: helo"));
+        conversation.push(Message::new(Role::Assistant, "Fixed."));
+        conversation.set_token_mark(4, 2000);
+        conversation.push(Message::new(Role::Harness, "loaded a model"));
+        conversation
+    }
+
+    #[tokio::test]
+    async fn compact_sends_only_the_conversation_and_replaces_it_with_the_summary() {
+        let mut conversation = worked_on();
+        let old = conversation.messages().to_vec();
+        let round = vec![
+            ChatDelta::Reasoning("hm".into()),
+            text("\nGoal: fix the typo. "),
+            text("Done: a.txt.\n"),
+            done("stop"),
+            usage(2100, 9),
+        ];
+        let (result, backend) = compact_with(round, &mut conversation, Some(2_500)).await;
+        let report = result.unwrap();
+
+        // No system prompt, environment or tools; the instruction last.
+        let requests = backend.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let (sent, tools) = &requests[0];
+        assert_eq!(*tools, 0);
+        assert_eq!(sent[..old.len()], old[..]);
+        assert_eq!(
+            sent[old.len()..],
+            [Message::new(Role::User, COMPACT_INSTRUCTION)]
+        );
+        // Capped to the room left (2,500 - 2,000), thinking off.
+        assert_eq!(
+            *backend.options.lock().unwrap(),
+            [RequestOptions {
+                max_tokens: Some(500),
+                thinking: Thinking::Off,
+            }]
+        );
+
+        let summary = "Goal: fix the typo. Done: a.txt.";
+        assert_eq!(
+            conversation.messages(),
+            [
+                Message::new(
+                    Role::User,
+                    format!(
+                        "Summary of the conversation so far, written to continue after \
+                         earlier messages were removed:\n\n{summary}"
+                    )
+                ),
+                Message::new(Role::Assistant, "Understood. Continuing from that summary."),
+            ]
+        );
+        assert_eq!(conversation.token_mark(), None, "the old count is gone");
+        assert_eq!(
+            report,
+            CompactReport {
+                before: 2000,
+                after: conversation.estimated_tokens(0),
+                summary: summary.into(),
+            }
+        );
+        assert!(report.after > 0 && report.after < report.before);
+    }
+
+    #[tokio::test]
+    async fn the_summary_is_capped_at_its_maximum_and_a_cut_off_one_is_kept() {
+        for context_length in [None, Some(100_000)] {
+            let mut conversation = worked_on();
+            let round = vec![text("Goal: fix"), done("length")];
+            let (result, backend) = compact_with(round, &mut conversation, context_length).await;
+            assert_eq!(result.unwrap().summary, "Goal: fix");
+            assert_eq!(
+                backend.options.lock().unwrap()[0].max_tokens,
+                Some(COMPACT_MAX_TOKENS)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn nothing_to_compact_sends_nothing() {
+        let mut conversation = Conversation::new();
+        conversation.push(Message::new(Role::Harness, "loaded a model"));
+        let (result, backend) = compact_with(vec![text("x")], &mut conversation, None).await;
+        assert_eq!(result.unwrap_err().to_string(), "nothing to compact");
+        assert!(backend.requests.lock().unwrap().is_empty());
+        assert_eq!(conversation.messages().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn too_full_to_compact_sends_nothing() {
+        let mut conversation = counted(7_937);
+        let (result, backend) = compact_with(vec![text("x")], &mut conversation, Some(8_000)).await;
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "too full to compact: about 7937 of 8000 tokens used; /clear to start over"
+        );
+        assert!(backend.requests.lock().unwrap().is_empty());
+        assert_eq!(conversation.messages(), [Message::new(Role::User, "go")]);
+
+        // Exactly the minimum room left is enough.
+        let mut conversation = counted(7_872);
+        let (result, backend) = compact_with(vec![text("x")], &mut conversation, Some(8_000)).await;
+        result.unwrap();
+        assert_eq!(
+            backend.options.lock().unwrap()[0].max_tokens,
+            Some(COMPACT_MIN_ROOM)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_summary_or_a_failed_request_leaves_the_conversation() {
+        let mut conversation = worked_on();
+        let old = conversation.messages().to_vec();
+        let blank = vec![ChatDelta::Reasoning("hm".into()), text(" \n"), done("stop")];
+        let (result, _) = compact_with(blank, &mut conversation, None).await;
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "the model returned an empty summary"
+        );
+        assert_eq!(conversation.messages(), old);
+        assert_eq!(conversation.token_mark(), Some((4, 2000)));
+
+        let backend = Arc::new(Scripted {
+            rounds: vec![vec![text("Goal: ")]],
+            fail: Some("the request exceeds the available context size"),
+            ..Scripted::default()
+        });
+        let result = agent(backend)
+            .compact("m", &mut conversation, &TurnOptions::default())
+            .await;
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "context full: the server refused the request \
+             (the request exceeds the available context size); /clear to start over"
+        );
+        assert_eq!(conversation.messages(), old);
     }
 
     #[tokio::test]
@@ -610,6 +1362,7 @@ mod tests {
                     name: "read_file".into(),
                     summary: format!("{lines} lines"),
                     is_error: false,
+                    output: msgs[2].content.clone(),
                 },
                 AgentEvent::Thinking,
                 AgentEvent::Text("It is ".into()),
@@ -700,6 +1453,7 @@ mod tests {
             name: "rm_rf".into(),
             summary: "unknown tool: rm_rf".into(),
             is_error: true,
+            output: "error: unknown tool: rm_rf".into(),
         }));
     }
 
@@ -787,7 +1541,13 @@ mod tests {
         conversation.push(Message::new(Role::User, "second"));
         let (tx, _rx) = mpsc::channel(256);
         agent
-            .run_turn("m", &mut conversation, tx, answers(&[]))
+            .run_turn(
+                "m",
+                &mut conversation,
+                tx,
+                answers(&[]),
+                &TurnOptions::default(),
+            )
             .await
             .unwrap();
 
@@ -860,6 +1620,7 @@ mod tests {
                     name: "edit_file".into(),
                     summary: done.into(),
                     is_error: false,
+                    output: done.into(),
                 },
             ]
         );
@@ -890,6 +1651,7 @@ mod tests {
             name: "edit_file".into(),
             summary: "declined".into(),
             is_error: true,
+            output: DECLINED_RESULT.into(),
         }));
         assert_eq!(
             conversation.messages()[3].content,
@@ -918,6 +1680,7 @@ mod tests {
             name: "edit_file".into(),
             summary: "declined: nobody to ask".into(),
             is_error: true,
+            output: DECLINED_RESULT.into(),
         }));
     }
 
@@ -947,6 +1710,7 @@ mod tests {
             name: "edit_file".into(),
             summary: error.into(),
             is_error: true,
+            output: format!("error: {error}"),
         }));
     }
 
@@ -1046,6 +1810,7 @@ mod tests {
             name: "bash".into(),
             summary: "exit 0, 1 line".into(),
             is_error: false,
+            output: output.clone(),
         }));
     }
 
@@ -1115,7 +1880,13 @@ mod tests {
             (answer, called)
         });
         let result = agent
-            .run_turn(&model.id, &mut conversation, tx, answers(&[]))
+            .run_turn(
+                &model.id,
+                &mut conversation,
+                tx,
+                answers(&[]),
+                &TurnOptions::default(),
+            )
             .await;
         let (answer, called) = printer.await.unwrap();
         println!("model: {}", model.id);
@@ -1173,7 +1944,13 @@ mod tests {
             (answer, called)
         });
         let result = agent
-            .run_turn(&model.id, &mut conversation, tx, decisions)
+            .run_turn(
+                &model.id,
+                &mut conversation,
+                tx,
+                decisions,
+                &TurnOptions::default(),
+            )
             .await;
         let (answer, called) = printer.await.unwrap();
         println!("model: {}", model.id);
@@ -1238,7 +2015,13 @@ mod tests {
             (answer, called)
         });
         let result = agent
-            .run_turn(&model.id, &mut conversation, tx, decisions)
+            .run_turn(
+                &model.id,
+                &mut conversation,
+                tx,
+                decisions,
+                &TurnOptions::default(),
+            )
             .await;
         let (answer, called) = printer.await.unwrap();
         println!("model: {}", model.id);
@@ -1248,5 +2031,111 @@ mod tests {
         result.unwrap();
         assert!(called.iter().any(|name| name == "bash"), "bash was called");
         assert!(answer.contains("17"), "the right count");
+    }
+    /// One live turn with every permission allowed; returns the answer text.
+    async fn live_turn(
+        agent: &Agent,
+        model: &str,
+        options: &TurnOptions,
+        conversation: &mut Conversation,
+    ) -> String {
+        let (tx, mut rx) = mpsc::channel(256);
+        let (allow, decisions) = mpsc::channel(4);
+        let printer = tokio::spawn(async move {
+            let mut answer = String::new();
+            while let Some(event) = rx.recv().await {
+                match &event {
+                    AgentEvent::Text(text) => answer.push_str(text),
+                    AgentEvent::PermissionRequested { .. } => {
+                        let _ = allow.send(Decision::Allow).await;
+                    }
+                    other => println!("{other:?}"),
+                }
+            }
+            answer
+        });
+        let result = agent
+            .run_turn(model, conversation, tx, decisions, options)
+            .await;
+        let answer = printer.await.unwrap();
+        result.unwrap();
+        answer
+    }
+
+    /// Live: a turn that edits a file, then `/compact`, then a question only
+    /// the summary can answer. Run with `--ignored` and a model loaded.
+    #[tokio::test]
+    #[ignore]
+    async fn live_agent_compacts_a_conversation() {
+        let lms = LmStudio::default();
+        let model = lms
+            .loaded_model()
+            .await
+            .unwrap()
+            .expect("load a model in LM Studio first");
+        let options = TurnOptions {
+            context_length: model.context_length(),
+            ..TurnOptions::default()
+        };
+        let dir = TempDir::new("live-compact");
+        dir.write(
+            "notes.txt",
+            "Shopping list
+- milk
+- breaad
+- eggs
+",
+        );
+        let root = dir.0.canonicalize().unwrap();
+        let agent = Agent::new(
+            Arc::new(lms),
+            Arc::new(ToolSet::standard(&root)),
+            Some(default_system_prompt()),
+        )
+        .with_environment(default_environment(&root));
+
+        let mut conversation = Conversation::new();
+        let ask = |conversation: &mut Conversation, text: &str| {
+            conversation.push(Message::new(Role::User, text));
+        };
+
+        ask(
+            &mut conversation,
+            "notes.txt has a spelling mistake. Fix it.",
+        );
+        let first = live_turn(&agent, &model.id, &options, &mut conversation).await;
+        println!("first answer: {first}");
+        let messages_before = conversation.messages().len();
+        let mark_before = conversation.token_mark();
+
+        let started = Instant::now();
+        let report = agent
+            .compact(&model.id, &mut conversation, &options)
+            .await
+            .unwrap();
+        println!(
+            "compacted {} messages (mark {mark_before:?}) in {:?}: about {} -> {} tokens",
+            messages_before,
+            started.elapsed(),
+            report.before,
+            report.after
+        );
+        println!(
+            "summary:
+{}",
+            report.summary
+        );
+        assert_eq!(conversation.messages().len(), 2);
+        assert!(report.after < report.before, "the summary is smaller");
+
+        ask(
+            &mut conversation,
+            "Without using any tools: which file did you change, and what was the mistake?",
+        );
+        let second = live_turn(&agent, &model.id, &options, &mut conversation).await;
+        println!("second answer: {second}");
+        let lower = second.to_lowercase();
+        assert!(lower.contains("notes.txt"), "remembers the file: {second}");
+        assert!(lower.contains("brea"), "remembers the typo: {second}");
     }
 }

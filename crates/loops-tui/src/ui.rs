@@ -53,6 +53,10 @@ const PERMISSION_HEIGHT: u16 = PermissionOption::ALL.len() as u16 + 2;
 /// Height of the banner: two lines and the border.
 const BANNER_HEIGHT: u16 = 4;
 
+/// Lines of command output kept from each end while it is folded (see
+/// [`fold_output`]).
+const OUTPUT_KEEP: usize = 4;
+
 /// Indent of a message's later lines, under the text after its prefix.
 const INDENT: &str = "  ";
 
@@ -111,7 +115,7 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     let waiting = matches!(app.mode, Mode::Permission { .. });
     let context = context_span(app.usage, app.context_length);
     let mut hints: Vec<&'static str> = Vec::new();
-    if app.turn_running() {
+    if app.busy() {
         hints.push("Esc cancel");
     }
     hints.push("/help");
@@ -120,7 +124,13 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         let separator = || Span::styled(" · ", Style::new().dim());
         let mut spans = vec![
             Span::raw(" "),
-            chip_span(&app.model_status, app.spinner, short, waiting),
+            chip_span(
+                &app.model_status,
+                app.spinner,
+                short,
+                waiting,
+                app.compacting(),
+            ),
         ];
         if let Some(context) = context.as_ref().filter(|_| with_context) {
             spans.extend([separator(), context.clone()]);
@@ -151,9 +161,20 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
 
 /// The model status as one styled span, with the short id when `short`.
 /// `waiting`: a turn is paused on the user's answer to a permission prompt.
-fn chip_span(status: &ModelStatus, spinner: usize, short: bool, waiting: bool) -> Span<'static> {
+/// `compacting`: the model is busy writing a `/compact` summary, not a reply.
+fn chip_span(
+    status: &ModelStatus,
+    spinner: usize,
+    short: bool,
+    waiting: bool,
+    compacting: bool,
+) -> Span<'static> {
     let frame = SPINNER[spinner % SPINNER.len()];
     let (text, style) = match status {
+        ModelStatus::Busy(id) if compacting => (
+            format!("{frame} {} compacting…", display_id(id, short)),
+            Style::new().magenta(),
+        ),
         ModelStatus::Busy(id) if waiting => (
             format!("{} waiting for you", display_id(id, short)),
             Style::new().yellow(),
@@ -242,7 +263,7 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) {
     let offset = u16::try_from(overflow - scrolled).unwrap_or(u16::MAX);
     frame.render_widget(paragraph.scroll((offset, 0)), area);
 
-    if scrolled > 0 && app.turn_running() {
+    if scrolled > 0 && app.busy() {
         let bottom_row = Rect {
             y: area.bottom() - 1,
             height: 1,
@@ -441,7 +462,8 @@ fn reply_text_lines<'a>(text: &'a str, lead: Span<'static>) -> Vec<Line<'a>> {
 
 /// One tool call, indented under its reply: `● name(args)` with the bullet
 /// and name magenta, then `⎿` and how it went, then the preview of the change
-/// it asked permission for, if any.
+/// it asked permission for, if any, then a command's output (dim, folded
+/// unless [`App::full_output`]).
 fn tool_lines(app: &App, call: &ToolCall) -> Vec<Line<'static>> {
     let magenta = Style::new().magenta();
     let mut lines = vec![
@@ -456,7 +478,38 @@ fn tool_lines(app: &App, call: &ToolCall) -> Vec<Line<'static>> {
     if let Some(preview) = app.tool_previews.get(&call.id) {
         lines.extend(preview_lines(preview, "      "));
     }
+    if let Some(output) = app.tool_outputs.get(&call.id) {
+        let dim = Style::new().dim();
+        lines.extend(
+            output_lines(output, app.full_output)
+                .into_iter()
+                .map(|line| Line::styled(format!("      {line}"), dim)),
+        );
+    }
     lines
+}
+
+/// The lines of a `bash` result drawn under its outcome: all but the first
+/// (`exit code: N`, which the summary already gives), through [`fold_output`].
+pub fn output_lines(output: &str, full: bool) -> Vec<String> {
+    let body: Vec<&str> = output.lines().skip(1).collect();
+    fold_output(&body, full)
+}
+
+/// `lines` as drawn: all of them when `full` or when they are few; otherwise
+/// the first and last [`OUTPUT_KEEP`] with `… N lines omitted …` between.
+/// The tool already caps what it returns, so `full` needs no cap of its own.
+fn fold_output(lines: &[&str], full: bool) -> Vec<String> {
+    if full || lines.len() <= 2 * OUTPUT_KEEP {
+        return lines.iter().map(|&line| line.to_owned()).collect();
+    }
+    let omitted = lines.len() - 2 * OUTPUT_KEEP;
+    let head = lines[..OUTPUT_KEEP].iter();
+    let tail = lines[lines.len() - OUTPUT_KEEP..].iter();
+    head.map(|&line| line.to_owned())
+        .chain([format!("… {omitted} lines omitted …")])
+        .chain(tail.map(|&line| line.to_owned()))
+        .collect()
 }
 
 /// `    ⎿ 31 lines`: dim when it worked, yellow if the user said no, red
@@ -536,7 +589,8 @@ fn call_arguments(arguments: &str) -> String {
 
 /// The input box: rounded, ` ❯ ` in its top border, `Message loops…` while
 /// empty (the text area's placeholder). Its color tells the state at a glance:
-/// red after a model error, magenta while the model replies, cyan otherwise.
+/// red after a model error, magenta while the model replies (or compacts),
+/// cyan otherwise.
 /// (The permission prompt, which takes its place, is yellow.)
 fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
     let color = match app.model_status {
@@ -1019,6 +1073,131 @@ mod tests {
         assert_eq!(buffer[(6, 3)].fg, Color::Red);
     }
 
+    /// An app showing one finished `bash` call whose output is `body` after
+    /// its exit code line.
+    fn ran_command(body: &[String]) -> App {
+        let mut app = plain_app();
+        let call = ToolCall {
+            id: "c1".into(),
+            name: "bash".into(),
+            arguments: r#"{"command":"ls"}"#.into(),
+        };
+        app.conversation
+            .push(Message::assistant_with_tool_calls("", vec![call]));
+        let summary = format!("exit 0, {} lines", body.len());
+        let outcome = ToolOutcome {
+            summary,
+            is_error: false,
+        };
+        app.tool_outcomes.insert("c1".into(), outcome);
+        let output = std::iter::once("exit code: 0".to_owned())
+            .chain(body.iter().cloned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.tool_outputs.insert("c1".into(), output);
+        app
+    }
+
+    fn numbered(n: usize) -> Vec<String> {
+        (1..=n).map(|i| format!("line {i}")).collect()
+    }
+
+    #[test]
+    fn a_command_shows_its_output_dim_under_its_outcome() {
+        let app = ran_command(&numbered(3));
+        let buffer = render_buffer(&app, 60, 12);
+        let screen = rows(&buffer);
+        assert_eq!(screen[0].trim_end(), r#"  ● bash("ls")"#);
+        assert_eq!(screen[1].trim_end(), "    ⎿ exit 0, 3 lines");
+        assert_eq!(screen[2].trim_end(), "      line 1");
+        assert_eq!(screen[3].trim_end(), "      line 2");
+        assert_eq!(screen[4].trim_end(), "      line 3");
+        assert!(is_dim(&buffer[(6, 2)]) && is_dim(&buffer[(6, 4)]));
+        assert!(!screen.join("\n").contains("exit code"));
+    }
+
+    #[test]
+    fn long_output_folds_to_its_ends_until_ctrl_o() {
+        let mut app = ran_command(&numbered(20));
+        let screen = rows(&render_buffer(&app, 60, 20));
+        let shown: Vec<&str> = screen[2..11].iter().map(|r| r.trim()).collect();
+        assert_eq!(
+            shown,
+            [
+                "line 1",
+                "line 2",
+                "line 3",
+                "line 4",
+                "… 12 lines omitted …",
+                "line 17",
+                "line 18",
+                "line 19",
+                "line 20",
+            ]
+        );
+        assert_eq!(screen[11].trim(), "");
+
+        press_ctrl_o(&mut app);
+        assert!(app.full_output);
+        let screen = rows(&render_buffer(&app, 60, 30));
+        let shown: Vec<&str> = screen[2..22].iter().map(|r| r.trim()).collect();
+        assert_eq!(shown, numbered(20));
+        assert!(!screen.join("\n").contains("omitted"));
+    }
+
+    fn press_ctrl_o(app: &mut App) {
+        let ctrl_o = KeyEvent::new(KeyCode::Char('o'), crossterm::event::KeyModifiers::CONTROL);
+        app.update(crate::app::AppEvent::Key(ctrl_o));
+    }
+
+    #[test]
+    fn output_of_eight_lines_or_fewer_is_not_folded() {
+        let eight = numbered(8);
+        let lines: Vec<&str> = eight.iter().map(String::as_str).collect();
+        assert_eq!(fold_output(&lines, false), eight);
+        assert_eq!(output_lines("exit code: 0", false), Vec::<String>::new());
+        assert_eq!(fold_output(&[], true), Vec::<String>::new());
+    }
+
+    /// A failed command shows its error on the outcome line and nothing more;
+    /// one that ran shows what it printed.
+    #[tokio::test]
+    async fn a_failed_command_shows_no_output() {
+        let (mut app, _backend, _rx) = chat_app(Vec::new());
+        type_line(&mut app, "go");
+        let command = |id: &str, is_error: bool, summary: &str, output: &str| {
+            [
+                AgentEvent::ToolStarted {
+                    id: id.into(),
+                    name: "bash".into(),
+                    arguments: r#"{"command":"make"}"#.into(),
+                },
+                AgentEvent::ToolFinished {
+                    id: id.into(),
+                    name: "bash".into(),
+                    summary: summary.into(),
+                    is_error,
+                    output: output.into(),
+                },
+            ]
+        };
+        let events = command("c1", true, "no make here", "error: no make here\nhidden")
+            .into_iter()
+            .chain(command(
+                "c2",
+                false,
+                "exit 0, 1 line",
+                "exit code: 0\nbuilt",
+            ));
+        for event in events {
+            app.update(agent_event(&app, event));
+        }
+        let screen = rows(&render_buffer(&app, 60, 16)).join("\n");
+        assert!(screen.contains("⎿ error: no make here"), "{screen}");
+        assert!(!screen.contains("hidden"), "{screen}");
+        assert!(screen.contains("      built"), "{screen}");
+    }
+
     #[tokio::test]
     async fn a_turn_with_a_tool_shows_the_tool_line_and_the_answer() {
         let read = ChatDelta::ToolCall {
@@ -1304,6 +1483,22 @@ mod tests {
         let buffer = render_buffer(&app, 60, 8);
         assert!(rows(&buffer)[7].starts_with(" ⠋ google/gemma-4-e4b replying"));
         assert_eq!(buffer[(1, 7)].fg, Color::Magenta);
+    }
+
+    /// `/compact` shows in the status bar, the input box is busy, and Esc
+    /// is offered.
+    #[tokio::test]
+    async fn compacting_spins_in_the_status_bar() {
+        let (mut app, _backend, _rx) = chat_app(Vec::new());
+        app.conversation.push(Message::new(Role::User, "hi"));
+        type_line(&mut app, "/compact");
+        let buffer = render_buffer(&app, 60, 8);
+        assert_eq!(
+            rows(&buffer)[7].trim_end(),
+            " ⠋ google/gemma-4-e4b compacting… · Esc cancel · /help"
+        );
+        assert_eq!(buffer[(1, 7)].fg, Color::Magenta);
+        assert_eq!(buffer[(0, 4)].fg, Color::Magenta, "busy input box");
     }
 
     /// An app with a ready model, a window of 1000 tokens, and `used` of them used.

@@ -5,8 +5,10 @@
 //! permission request is allowed, and the whole turn runs under a wall-clock
 //! timeout. The streams are split so a caller can capture them separately:
 //! stdout carries only the model's final answer, stderr a live log with one
-//! line per agent event. The exit code says how it went (see [`USAGE`]), and
-//! `--stats` leaves a JSON summary behind for comparison across runs.
+//! line per agent event. A turn that fails or times out still prints the
+//! answer text it got (e.g. a reply cut off at the output limit too often), so
+//! check the exit code, not stdout, for success (see [`USAGE`]); `--stats`
+//! leaves a JSON summary behind for comparison across runs.
 //!
 //! The summary is folded from the turn's [`AgentEvent`]s by [`fold_stats`], a
 //! pure function, so it is tested without a model.
@@ -20,9 +22,10 @@ use std::{
 use anyhow::{Context, Result, bail};
 use loops_core::{
     Conversation, Message, Role,
-    agent::{Agent, AgentEvent, Decision, default_environment, default_system_prompt},
+    agent::{Agent, AgentEvent, Decision, TurnOptions, default_environment, default_system_prompt},
     backend::ModelBackend,
-    lmstudio::{LmStudio, ModelState},
+    chat::Thinking,
+    lmstudio::{LmStudio, ModelInfo, ModelState},
     tools::ToolSet,
 };
 use serde_json::{Value, json};
@@ -45,9 +48,14 @@ Options (with --print):
       --stats <path>       write a JSON summary of the run to <path>
       --model <id>         model to use (default: the loaded one; loads <id>
                            if it is not loaded)
+      --think <level>      how much the model thinks: off, low, medium, high,
+                           or default (the model's own choice; the default)
+      --max-tokens <n>     cap each reply at <n> tokens, thinking included
+                           (default: the room left in the context window)
   -h, --help               print this help
 
 Every tool call is allowed without asking.
+A failed or timed-out turn still prints any answer text it got.
 Exit codes: 0 done, 1 turn failed or timed out, 2 setup error.
 ";
 
@@ -82,6 +90,10 @@ pub struct PrintArgs {
     pub stats: Option<PathBuf>,
     /// Model to use; `None` means whatever is loaded.
     pub model: Option<String>,
+    /// How much the model may think.
+    pub thinking: Thinking,
+    /// Most tokens one reply may use; `None` for no cap beyond the window.
+    pub max_tokens: Option<u64>,
 }
 
 /// Parses the arguments after the program name. Options other than `--help`
@@ -93,6 +105,8 @@ pub fn parse(args: &[String]) -> Result<Command> {
     let mut timeout = DEFAULT_TIMEOUT;
     let mut stats = None;
     let mut model = None;
+    let mut thinking = Thinking::Default;
+    let mut max_tokens = None;
     // The first `--print` option seen, for the error if `--print` is missing.
     let mut option = None;
 
@@ -110,6 +124,13 @@ pub fn parse(args: &[String]) -> Result<Command> {
             "--timeout" => timeout = Duration::from_secs(positive(arg, value()?)?),
             "--stats" => stats = Some(PathBuf::from(value()?)),
             "--model" => model = Some(value()?.to_owned()),
+            "--think" => {
+                let level = value()?;
+                thinking = Thinking::parse(level).with_context(|| {
+                    format!("{arg} needs off, low, medium, high or default, got {level:?}")
+                })?;
+            }
+            "--max-tokens" => max_tokens = Some(positive(arg, value()?)?),
             other => bail!("unknown argument: {other}"),
         }
         if !matches!(arg.as_str(), "-p" | "--print") {
@@ -132,6 +153,8 @@ pub fn parse(args: &[String]) -> Result<Command> {
         timeout,
         stats,
         model,
+        thinking,
+        max_tokens,
     }))
 }
 
@@ -187,6 +210,9 @@ pub struct Stats {
     pub model: String,
     /// Model requests made: one `Usage` event per request.
     pub rounds: usize,
+    /// Replies cut off at the output limit and continued (or given up on):
+    /// one per `ReplyCutOff` event.
+    pub cut_offs: usize,
     /// Finished tool calls, in order. A call cut off by the timeout is not here.
     pub tool_calls: Vec<ToolCallStat>,
     /// Prompt tokens of the last request: how full the context was at the end.
@@ -216,11 +242,13 @@ impl Stats {
                 })
             })
             .collect();
+        // Keys come out in alphabetical order (`serde_json` sorts them).
         json!({
             "outcome": self.outcome.as_str(),
             "error": self.error,
             "model": self.model,
             "rounds": self.rounds,
+            "cut_offs": self.cut_offs,
             "tool_calls": tool_calls,
             "prompt_tokens_last": self.prompt_tokens_last,
             "completion_tokens_total": self.completion_tokens_total,
@@ -244,6 +272,7 @@ pub fn fold_stats(events: &[AgentEvent], elapsed: Duration) -> Stats {
         error: Some("the turn ended without a result".to_owned()),
         model: String::new(),
         rounds: 0,
+        cut_offs: 0,
         tool_calls: Vec::new(),
         prompt_tokens_last: 0,
         completion_tokens_total: 0,
@@ -279,6 +308,7 @@ pub fn fold_stats(events: &[AgentEvent], elapsed: Duration) -> Stats {
                 stats.prompt_tokens_total += prompt_tokens;
                 stats.completion_tokens_total += completion_tokens;
             }
+            AgentEvent::ReplyCutOff { .. } => stats.cut_offs += 1,
             AgentEvent::Thinking => {}
             AgentEvent::TurnDone => {
                 stats.outcome = Outcome::Done;
@@ -298,8 +328,8 @@ pub fn fold_stats(events: &[AgentEvent], elapsed: Duration) -> Stats {
 /// error too, such as a stats file that cannot be written.
 pub async fn run(args: PrintArgs) -> Result<u8> {
     let backend: Arc<dyn ModelBackend> = Arc::new(LmStudio::default());
-    let model = match pick_model(backend.as_ref(), args.model.as_deref()).await {
-        Ok(model) => model,
+    let info = match pick_model(backend.as_ref(), args.model.as_deref()).await {
+        Ok(info) => info,
         Err(err) => {
             eprintln!("error: {err:#}");
             return Ok(2);
@@ -314,8 +344,18 @@ pub async fn run(args: PrintArgs) -> Result<u8> {
     let mut agent = Agent::new(backend, tools, Some(default_system_prompt()))
         .with_environment(default_environment(&cwd));
     agent.max_iterations = args.max_rounds;
+    let options = TurnOptions {
+        context_length: info.context_length(),
+        max_output_tokens: args.max_tokens,
+        thinking: args.thinking,
+    };
+    let model = info.id;
+    let window = options
+        .context_length
+        .map_or("unknown".to_owned(), |n| n.to_string());
     eprintln!(
-        "loops: model {model}, up to {} rounds, timeout {}s, in {}",
+        "loops: model {model} (window {window}), thinking {}, up to {} rounds, timeout {}s, in {}",
+        options.thinking,
         args.max_rounds,
         args.timeout.as_secs(),
         cwd.display()
@@ -330,7 +370,7 @@ pub async fn run(args: PrintArgs) -> Result<u8> {
     let turn = tokio::spawn(async move {
         // The outcome arrives as `TurnDone` / `TurnFailed` on `sink`.
         let _ = agent
-            .run_turn(&turn_model, &mut conversation, sink, decisions)
+            .run_turn(&turn_model, &mut conversation, sink, decisions, &options)
             .await;
     });
 
@@ -381,8 +421,10 @@ pub async fn run(args: PrintArgs) -> Result<u8> {
         );
     }
 
-    if stats.outcome == Outcome::Done {
-        println!("{}", stats.answer.trim_end());
+    // Also on failure: a reply cut off too often is still most of an answer.
+    let answer = stats.answer.trim_end();
+    if !answer.is_empty() {
+        println!("{answer}");
     }
     if let Some(path) = &args.stats {
         let text = serde_json::to_string_pretty(&stats.to_json())?;
@@ -393,12 +435,13 @@ pub async fn run(args: PrintArgs) -> Result<u8> {
 }
 
 /// Starts the backend and settles on a model: `wanted` if given (loading it
-/// when it is not loaded yet), else the loaded one.
-async fn pick_model(backend: &dyn ModelBackend, wanted: Option<&str>) -> Result<String> {
+/// when it is not loaded yet), else the loaded one. Returns its entry, whose
+/// context window bounds the turn.
+async fn pick_model(backend: &dyn ModelBackend, wanted: Option<&str>) -> Result<ModelInfo> {
     let loaded = backend.start().await.context("could not start LM Studio")?;
     let Some(wanted) = wanted else {
         return match loaded {
-            Some(model) => Ok(model.id),
+            Some(model) => Ok(model),
             None => bail!("no model loaded (load one in LM Studio or pass --model <id>)"),
         };
     };
@@ -406,16 +449,16 @@ async fn pick_model(backend: &dyn ModelBackend, wanted: Option<&str>) -> Result<
     let already = backend
         .list_models()
         .await?
-        .iter()
-        .any(|m| m.id == wanted && m.state == ModelState::Loaded);
-    if !already {
-        eprintln!("loops: loading {wanted}");
-        backend
-            .load_model(wanted)
-            .await
-            .with_context(|| format!("could not load {wanted}"))?;
+        .into_iter()
+        .find(|m| m.id == wanted && m.state == ModelState::Loaded);
+    if let Some(model) = already {
+        return Ok(model);
     }
-    Ok(wanted.to_owned())
+    eprintln!("loops: loading {wanted}");
+    backend
+        .load_model(wanted)
+        .await
+        .with_context(|| format!("could not load {wanted}"))
 }
 
 /// The log line for `event`, without its time prefix; `None` for events too
@@ -442,6 +485,9 @@ fn log_line(event: &AgentEvent) -> Option<String> {
             prompt_tokens,
             completion_tokens,
         } => format!("usage {prompt_tokens}+{completion_tokens}"),
+        AgentEvent::ReplyCutOff { attempt, max } => {
+            format!("reply cut off, continuing ({attempt}/{max})")
+        }
         AgentEvent::TurnDone => "turn done".to_owned(),
         AgentEvent::TurnFailed(err) => format!("turn failed: {err}"),
     };
@@ -505,6 +551,8 @@ mod tests {
                 timeout: Duration::from_secs(300),
                 stats: None,
                 model: None,
+                thinking: Thinking::Default,
+                max_tokens: None,
             }
         );
         assert_eq!(print_args(&["-p", "fix it"]), args);
@@ -523,6 +571,10 @@ mod tests {
             "120",
             "--model",
             "google/gemma-4-e4b",
+            "--think",
+            "Off",
+            "--max-tokens",
+            "2048",
         ]);
         assert_eq!(
             args,
@@ -532,6 +584,8 @@ mod tests {
                 timeout: Duration::from_secs(120),
                 stats: Some(PathBuf::from("out/stats.json")),
                 model: Some("google/gemma-4-e4b".into()),
+                thinking: Thinking::Off,
+                max_tokens: Some(2048),
             }
         );
     }
@@ -551,6 +605,8 @@ mod tests {
             "--timeout",
             "--stats",
             "--model",
+            "--think",
+            "--max-tokens",
         ] {
             assert_eq!(
                 parse_error(&["-p", "x", option]),
@@ -571,6 +627,12 @@ mod tests {
         assert_eq!(parse_error(&["hello"]), "unknown argument: hello");
         assert!(parse_error(&["-p", "  "]).contains("non-empty"));
         assert_eq!(parse_error(&["--model", "m"]), "--model needs --print");
+        assert!(parse_error(&["-p", "x", "--max-tokens", "0"]).contains("above 0"));
+        assert_eq!(
+            parse_error(&["-p", "x", "--think", "max"]),
+            r#"--think needs off, low, medium, high or default, got "max""#
+        );
+        assert_eq!(parse_error(&["--think", "low"]), "--think needs --print");
     }
 
     fn usage(prompt_tokens: u64, completion_tokens: u64) -> AgentEvent {
@@ -592,6 +654,7 @@ mod tests {
                 name: name.into(),
                 summary: summary.into(),
                 is_error,
+                output: String::new(),
             },
         ]
     }
@@ -617,6 +680,7 @@ mod tests {
         assert_eq!(stats.outcome, Outcome::Done);
         assert_eq!(stats.error, None);
         assert_eq!(stats.rounds, 3);
+        assert_eq!(stats.cut_offs, 0);
         assert_eq!(stats.prompt_tokens_last, 1401);
         assert_eq!(stats.prompt_tokens_total, 3601);
         assert_eq!(stats.completion_tokens_total, 261);
@@ -643,6 +707,54 @@ mod tests {
         assert_eq!(json["elapsed_ms"], 10_300);
         assert_eq!(json["tool_calls"][1]["is_error"], true);
         assert_eq!(json["answer"], "Fixed the typo.");
+        assert_eq!(json["cut_offs"], 0);
+    }
+
+    #[test]
+    fn cut_offs_are_counted_and_the_continued_answer_is_whole() {
+        let cut_off = |attempt| AgentEvent::ReplyCutOff { attempt, max: 2 };
+        let events = [
+            AgentEvent::Text("Hello, ".into()),
+            usage(500, 256),
+            cut_off(1),
+            AgentEvent::Text("wor".into()),
+            usage(780, 256),
+            cut_off(2),
+            AgentEvent::Text("ld.".into()),
+            usage(1060, 3),
+            AgentEvent::TurnDone,
+        ];
+        let stats = fold_stats(&events, Duration::ZERO);
+        assert_eq!(stats.cut_offs, 2);
+        assert_eq!(stats.rounds, 3);
+        assert_eq!(stats.answer, "Hello, world.");
+        assert_eq!(stats.to_json()["cut_offs"], 2);
+        assert_eq!(
+            log_line(&cut_off(1)).unwrap(),
+            "reply cut off, continuing (1/2)"
+        );
+    }
+
+    /// The agent gives up on the third cut-off without a `ReplyCutOff` for
+    /// it; the text streamed so far is still the answer printed.
+    #[test]
+    fn a_reply_cut_off_too_often_fails_but_keeps_its_text() {
+        let cut_off = |attempt| AgentEvent::ReplyCutOff { attempt, max: 2 };
+        let events = [
+            AgentEvent::Text("partial".into()),
+            usage(500, 256),
+            cut_off(1),
+            AgentEvent::Text(" more".into()),
+            usage(780, 256),
+            cut_off(2),
+            AgentEvent::Text(" end".into()),
+            usage(1060, 256),
+            AgentEvent::TurnFailed("reply cut off at the output limit 3 times".into()),
+        ];
+        let stats = fold_stats(&events, Duration::ZERO);
+        assert_eq!(stats.outcome, Outcome::Failed);
+        assert_eq!(stats.cut_offs, 2);
+        assert_eq!(stats.answer, "partial more end");
     }
 
     #[test]

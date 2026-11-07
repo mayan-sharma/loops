@@ -82,6 +82,39 @@ impl Message {
 #[derive(Debug, Clone, Default)]
 pub struct Conversation {
     messages: Vec<Message>,
+    /// The last token count the server gave for a prefix of `messages`.
+    mark: Option<TokenMark>,
+}
+
+/// "The first `messages` messages measured `tokens` tokens on the server,
+/// reply included": the prompt (system prompt and tools too) plus the reply
+/// that came back, as one request's usage reported them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TokenMark {
+    messages: usize,
+    tokens: u64,
+}
+
+/// A rough token count for `chars` characters: a quarter, rounded up. Only
+/// ever applied to the little the server has not counted yet (see
+/// [`Conversation::estimated_tokens`]), never to a whole conversation that the
+/// server has measured, since the guess can be far off for code or non-English text.
+pub(crate) fn estimate_tokens(chars: usize) -> u64 {
+    (chars as u64).div_ceil(4)
+}
+
+/// [`estimate_tokens`] of what of `message` is sent: its content and its tool
+/// calls' arguments. Harness lines are never sent, so they count as nothing.
+fn estimate_message(message: &Message) -> u64 {
+    if message.role == Role::Harness {
+        return 0;
+    }
+    let arguments: usize = message
+        .tool_calls
+        .iter()
+        .map(|call| call.arguments.chars().count())
+        .sum();
+    estimate_tokens(message.content.chars().count() + arguments)
 }
 
 impl Conversation {
@@ -107,13 +140,53 @@ impl Conversation {
 
     /// Removes and returns the message at `index` (e.g. a reply that never
     /// arrived), shifting later ones down. Panics if `index` is out of range.
+    /// Removing a message the token mark covers drops the mark, since the
+    /// server's count no longer describes what is left.
     pub fn remove(&mut self, index: usize) -> Message {
+        if self.mark.is_some_and(|mark| index < mark.messages) {
+            self.mark = None;
+        }
         self.messages.remove(index)
+    }
+
+    /// Replaces every message with `messages` (e.g. a summary of them) and
+    /// drops the token mark, since the server's count described the old ones.
+    pub fn replace_all(&mut self, messages: Vec<Message>) {
+        self.messages = messages;
+        self.mark = None;
     }
 
     /// All messages, oldest first.
     pub fn messages(&self) -> &[Message] {
         &self.messages
+    }
+
+    /// Records that the first `messages` messages measured `tokens` tokens on
+    /// the server, reply included (a request's prompt plus completion tokens,
+    /// where the reply is message `messages - 1`). Replaces any earlier mark.
+    pub fn set_token_mark(&mut self, messages: usize, tokens: u64) {
+        self.mark = Some(TokenMark { messages, tokens });
+    }
+
+    /// The token mark as `(messages, tokens)`, if the server has counted any.
+    pub fn token_mark(&self) -> Option<(usize, u64)> {
+        self.mark.map(|mark| (mark.messages, mark.tokens))
+    }
+
+    /// About how many tokens the next request carries before any new reply.
+    /// With a token mark it is the server's count plus a characters/4 guess
+    /// for the few messages added since (tool results, the next user message);
+    /// without one, `overhead` (the system prompt and tool specs, which the
+    /// caller estimates) plus that guess for every message.
+    pub fn estimated_tokens(&self, overhead: u64) -> u64 {
+        let (base, counted) = match self.mark {
+            Some(mark) => (mark.tokens, mark.messages.min(self.messages.len())),
+            None => (overhead, 0),
+        };
+        base + self.messages[counted..]
+            .iter()
+            .map(estimate_message)
+            .sum::<u64>()
     }
 }
 
@@ -207,5 +280,74 @@ mod tests {
         assert_eq!(result.tool_call_id.as_deref(), Some("call_1"));
         assert!(result.tool_calls.is_empty());
         assert_eq!(Message::new(Role::User, "hi").tool_call_id, None);
+    }
+
+    #[test]
+    fn without_a_mark_everything_is_guessed_on_top_of_the_overhead() {
+        let mut convo = Conversation::new();
+        assert_eq!(convo.token_mark(), None);
+        assert_eq!(convo.estimated_tokens(100), 100);
+        // 5 characters round up to 2 tokens.
+        convo.push(Message::new(Role::User, "hello"));
+        // 3 of text plus 9 of arguments: 3 tokens.
+        let call = ToolCall {
+            id: "c".into(),
+            name: "list_files".into(),
+            arguments: r#"{"a":"b"}"#.into(),
+        };
+        convo.push(Message::assistant_with_tool_calls("abc", vec![call]));
+        // Never sent, so never counted.
+        convo.push(Message::new(Role::Harness, "loaded a model"));
+        assert_eq!(convo.estimated_tokens(100), 100 + 2 + 3);
+    }
+
+    #[test]
+    fn a_mark_replaces_the_guess_for_what_it_covers() {
+        let mut convo = Conversation::new();
+        convo.push(Message::new(Role::User, "x".repeat(4000)));
+        convo.push(Message::new(Role::Assistant, "y".repeat(4000)));
+        convo.set_token_mark(2, 1500);
+        assert_eq!(convo.token_mark(), Some((2, 1500)));
+        assert_eq!(convo.estimated_tokens(100), 1500, "no overhead on top");
+
+        // A tool result added since is guessed; pushing keeps the mark.
+        convo.push(Message::tool_result("c", "12345678"));
+        assert_eq!(convo.token_mark(), Some((2, 1500)));
+        assert_eq!(convo.estimated_tokens(100), 1502);
+    }
+
+    #[test]
+    fn removing_a_counted_message_drops_the_mark() {
+        let mut convo = Conversation::new();
+        for text in ["a", "b", "c"] {
+            convo.push(Message::new(Role::User, text));
+        }
+        convo.set_token_mark(2, 50);
+        convo.remove(2);
+        assert_eq!(convo.token_mark(), Some((2, 50)), "after the mark: kept");
+        convo.remove(1);
+        assert_eq!(convo.token_mark(), None);
+        assert_eq!(convo.estimated_tokens(10), 10 + 1);
+    }
+
+    #[test]
+    fn replacing_all_messages_drops_the_mark() {
+        let mut convo = Conversation::new();
+        convo.push(Message::new(Role::User, "x".repeat(4000)));
+        convo.set_token_mark(1, 1200);
+        convo.replace_all(vec![
+            Message::new(Role::User, "summary"),
+            Message::new(Role::Assistant, "ok"),
+        ]);
+        assert_eq!(
+            convo.messages(),
+            [
+                Message::new(Role::User, "summary"),
+                Message::new(Role::Assistant, "ok"),
+            ]
+        );
+        assert_eq!(convo.token_mark(), None);
+        // 7 characters are 2 tokens, 2 are 1: guessed again from scratch.
+        assert_eq!(convo.estimated_tokens(10), 10 + 2 + 1);
     }
 }

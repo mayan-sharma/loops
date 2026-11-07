@@ -355,25 +355,50 @@ struct EditPlan {
     at: usize,
     /// Line number (from 1) where `old` starts.
     line: usize,
+    /// The text being replaced: the model's `old`, or that with
+    /// [`strip_line_numbers`] applied when only that matched.
+    old: String,
+    /// The text put in its place: the model's `new`, stripped likewise when
+    /// `old` was and `new` has the same `N: ` rows.
+    new: String,
 }
 
 impl EditFile {
     /// Reads the file and finds the single occurrence of `old`. Both `preview`
     /// and `run` call this, so `run` checks the file as it is when the user
     /// says yes, not as it was when they were asked.
+    ///
+    /// When `old` is not in the file but is `read_file` rows pasted verbatim
+    /// (`3: - bread`), the rows without their numbers are looked for instead,
+    /// and used if they occur once; `new` loses its numbers too if it has them.
     async fn plan(&self, args: &EditArgs) -> Result<EditPlan> {
         if args.old.is_empty() {
             bail!("old text is empty; give the exact text to replace");
         }
         let (full, text) = read_text(&self.root, &args.path).await?;
         let path = &args.path;
-        match occurrences(&text, &args.old)[..] {
+        let (mut old, mut new) = (args.old.clone(), args.new.clone());
+        let mut found = occurrences(&text, &old);
+        if found.is_empty()
+            && let Some(stripped) = strip_line_numbers(&args.old)
+            && !stripped.is_empty()
+            && let [at] = occurrences(&text, &stripped)[..]
+        {
+            found = vec![at];
+            old = stripped;
+            if let Some(stripped) = strip_line_numbers(&args.new) {
+                new = stripped;
+            }
+        }
+        match found[..] {
             [] => bail!("old text not found in {path}"),
             [at] => Ok(EditPlan {
                 line: text[..at].matches('\n').count() + 1,
                 full,
                 text,
                 at,
+                old,
+                new,
             }),
             ref found => bail!(
                 "old text found {} times in {path}; include more surrounding lines so it is unique",
@@ -389,7 +414,9 @@ impl Tool for EditFile {
             name: "edit_file".into(),
             description: "Replace one exact snippet in an existing text file. Read the file \
                           first. `old` must match the file exactly and occur only once, so \
-                          include enough surrounding lines to make it unique."
+                          include enough surrounding lines to make it unique. The `N: ` line \
+                          numbers that read_file shows are not part of the file; do not \
+                          include them in `old` or `new`."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -412,15 +439,17 @@ impl Tool for EditFile {
                 mut text,
                 at,
                 line,
+                old,
+                new,
             } = self.plan(&args).await?;
-            text.replace_range(at..at + args.old.len(), &args.new);
+            text.replace_range(at..at + old.len(), &new);
             tokio::fs::write(&full, text)
                 .await
                 .with_context(|| format!("writing {}", args.path))?;
             Ok(format!(
                 "replaced {} with {} at line {line}",
-                count_lines(args.old.lines().count()),
-                args.new.lines().count()
+                count_lines(old.lines().count()),
+                new.lines().count()
             ))
         })
     }
@@ -441,10 +470,10 @@ impl Tool for EditFile {
             let args = args?;
             let plan = self.plan(&args).await?;
             let mut out = format!("edit {} at line {}", args.path, plan.line);
-            for line in args.old.lines() {
+            for line in plan.old.lines() {
                 out.push_str(&format!("\n- {line}"));
             }
-            for line in args.new.lines() {
+            for line in plan.new.lines() {
                 out.push_str(&format!("\n+ {line}"));
             }
             Ok(out)
@@ -463,6 +492,35 @@ fn occurrences(haystack: &str, needle: &str) -> Vec<usize> {
         from += i + step;
     }
     found
+}
+
+/// `text` without the `N: ` prefixes [`numbered`] puts on `read_file` rows,
+/// or `None` if it is not such rows: every line must start with a number and
+/// `: ` (or just `:` for a blank line, whose trailing space a model may drop),
+/// and the numbers must count up by one. Line endings are kept.
+///
+/// A model sometimes pastes the rows it read into `edit_file`'s `old`. A file
+/// whose lines really start like that is unaffected: `edit_file` tries the
+/// text as given first.
+fn strip_line_numbers(text: &str) -> Option<String> {
+    let mut out = String::with_capacity(text.len());
+    let mut next: Option<usize> = None;
+    for row in text.split_inclusive('\n') {
+        let digits = row.len() - row.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        let n: usize = row[..digits].parse().ok()?;
+        if next.is_some_and(|next| next != n) {
+            return None;
+        }
+        next = Some(n + 1);
+        let rest = row[digits..].strip_prefix(':')?;
+        let line = match rest.strip_prefix(' ') {
+            Some(line) => line,
+            None if matches!(rest, "" | "\n" | "\r\n") => rest,
+            None => return None,
+        };
+        out.push_str(line);
+    }
+    next.map(|_| out)
 }
 
 /// `write_file { path, content }`: creates a file, or replaces a whole one.
@@ -1277,6 +1335,101 @@ mod tests {
         }
         assert_eq!(dir.read("root/a.txt"), before);
         assert_eq!(dir.read("secret.txt"), "no");
+    }
+
+    #[tokio::test]
+    async fn edit_file_strips_pasted_line_numbers_from_old() {
+        let dir = TempDir::new("edit-numbered");
+        dir.write("a.txt", "a\nb\nc\n");
+        let tools = ToolSet::standard(&dir.0);
+        let out = tools
+            .run("edit_file", &edit_args("a.txt", "2: b", "B"))
+            .await
+            .unwrap();
+        assert_eq!(out, "replaced 1 line with 1 at line 2");
+        assert_eq!(dir.read("a.txt"), "a\nB\nc\n");
+    }
+
+    #[tokio::test]
+    async fn edit_file_strips_numbers_from_new_too_when_it_has_them() {
+        let dir = TempDir::new("edit-numbered-both");
+        dir.write("a.txt", "a\nb\nc\n");
+        let tools = ToolSet::standard(&dir.0);
+        let args = edit_args("a.txt", "2: b\n3: c", "2: B\n3: C");
+
+        let preview = tools.preview("edit_file", &args).await.unwrap();
+        assert_eq!(preview, "edit a.txt at line 2\n- b\n- c\n+ B\n+ C");
+        assert_eq!(dir.read("a.txt"), "a\nb\nc\n", "preview changes nothing");
+
+        let out = tools.run("edit_file", &args).await.unwrap();
+        assert_eq!(out, "replaced 2 lines with 2 at line 2");
+        assert_eq!(dir.read("a.txt"), "a\nB\nC\n");
+    }
+
+    #[tokio::test]
+    async fn edit_file_keeps_new_verbatim_when_only_old_is_numbered() {
+        let dir = TempDir::new("edit-numbered-old");
+        dir.write("a.txt", "a\nb\nc\n");
+        let tools = ToolSet::standard(&dir.0);
+        let args = edit_args("a.txt", "1: a\n2: b\n", "x\n7: y\n");
+
+        let preview = tools.preview("edit_file", &args).await.unwrap();
+        assert_eq!(preview, "edit a.txt at line 1\n- a\n- b\n+ x\n+ 7: y");
+
+        let out = tools.run("edit_file", &args).await.unwrap();
+        assert_eq!(out, "replaced 2 lines with 2 at line 1");
+        assert_eq!(dir.read("a.txt"), "x\n7: y\nc\n");
+    }
+
+    #[tokio::test]
+    async fn edit_file_strips_numbers_only_when_the_text_itself_is_not_found() {
+        let dir = TempDir::new("edit-numbered-not");
+        dir.write("a.txt", "1: x\nb\nc\n");
+        let tools = ToolSet::standard(&dir.0);
+
+        // Not consecutive: not read_file rows, so not stripped.
+        let err = tools
+            .run("edit_file", &edit_args("a.txt", "2: b\n5: c", "x"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "old text not found in a.txt");
+
+        // A line that really reads `1: x` is matched as it is.
+        let out = tools
+            .run("edit_file", &edit_args("a.txt", "1: x", "1: y"))
+            .await
+            .unwrap();
+        assert_eq!(out, "replaced 1 line with 1 at line 1");
+        assert_eq!(dir.read("a.txt"), "1: y\nb\nc\n");
+    }
+
+    #[test]
+    fn strip_line_numbers_takes_only_consecutive_numbered_rows() {
+        assert_eq!(strip_line_numbers("b"), None);
+        assert_eq!(strip_line_numbers("let x = 1;\nlet y = 2;"), None);
+        assert_eq!(strip_line_numbers(""), None);
+        assert_eq!(
+            strip_line_numbers("3: - breaad").as_deref(),
+            Some("- breaad")
+        );
+        assert_eq!(
+            strip_line_numbers("9: a\n10:\n11:     b\n").as_deref(),
+            Some("a\n\n    b\n"),
+            "a blank row may lose its trailing space; indentation is kept"
+        );
+        assert_eq!(strip_line_numbers("4: \n").as_deref(), Some("\n"));
+        assert_eq!(
+            strip_line_numbers("1: a\nb\n3: c"),
+            None,
+            "a row without a number"
+        );
+        assert_eq!(strip_line_numbers("1: a\n3: c"), None, "not consecutive");
+        assert_eq!(
+            strip_line_numbers("12:30 lunch"),
+            None,
+            "no space after the colon"
+        );
+        assert_eq!(strip_line_numbers(": a"), None);
     }
 
     #[tokio::test]

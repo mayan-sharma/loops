@@ -19,7 +19,7 @@ use tokio::{process::Command, sync::mpsc};
 use crate::{
     Message,
     backend::{BoxFuture, ModelBackend},
-    chat::{ChatDelta, SseParser, parse_chunk, request_body},
+    chat::{ChatDelta, RequestOptions, SseParser, parse_chunk, request_body},
     tools::ToolSpec,
 };
 
@@ -214,7 +214,8 @@ impl LmStudio {
 
     /// Streams a reply from `model` into `sink`. One `Done` is sent; a `Usage`
     /// may follow it, since the server reports usage after the reply ends.
-    /// `tools` are offered to the model; pass `&[]` for plain chat.
+    /// `tools` are offered to the model; pass `&[]` for plain chat. `options`
+    /// caps the reply and sets how much the model thinks.
     ///
     /// No overall timeout: a long reply is legitimately slow, and the caller
     /// cancels by dropping this future. Returns early if `sink` is closed.
@@ -223,10 +224,11 @@ impl LmStudio {
         model: &str,
         messages: &[Message],
         tools: &[ToolSpec],
+        options: &RequestOptions,
         sink: mpsc::Sender<ChatDelta>,
     ) -> Result<()> {
         let url = format!("{}/v1/chat/completions", self.base_url);
-        let body = request_body(model, messages, tools);
+        let body = request_body(model, messages, tools, options);
         let mut response = self
             .http
             .post(&url)
@@ -316,9 +318,10 @@ impl ModelBackend for LmStudio {
         model: &'a str,
         messages: &'a [Message],
         tools: &'a [ToolSpec],
+        options: &'a RequestOptions,
         sink: mpsc::Sender<ChatDelta>,
     ) -> BoxFuture<'a, Result<()>> {
-        Box::pin(LmStudio::chat(self, model, messages, tools, sink))
+        Box::pin(LmStudio::chat(self, model, messages, tools, options, sink))
     }
 }
 
@@ -491,7 +494,9 @@ mod tests {
             }
             (reply, usage)
         });
-        lms.chat(&model.id, &messages, &[], tx).await.unwrap();
+        lms.chat(&model.id, &messages, &[], &RequestOptions::default(), tx)
+            .await
+            .unwrap();
         let (reply, usage) = printer.await.unwrap();
         println!("{} replied {reply:?} in {:?}", model.id, started.elapsed());
         assert!(reply.to_lowercase().contains("hello from loops"));

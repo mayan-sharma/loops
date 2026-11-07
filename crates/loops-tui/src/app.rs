@@ -30,6 +30,12 @@
 //! command, so a yes to `cargo test` does not let `rm -rf .` through. Requests
 //! whose scope the user always allowed are answered at once.
 //!
+//! # Compaction
+//!
+//! `/compact` runs in the background like a turn, on its own copy of the
+//! conversation, and blocks sending the same way; Esc cancels it. When it
+//! finishes, the compacted copy replaces the transcript, as `/clear` would.
+//!
 //! Because `update` takes plain values and touches no terminal, it can be unit
 //! tested by feeding it synthetic key events (see the tests at the bottom).
 
@@ -44,7 +50,8 @@ use std::{
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use loops_core::{
     Conversation, Message, Role, ToolCall,
-    agent::{Agent, AgentEvent, Decision},
+    agent::{Agent, AgentEvent, CompactReport, Decision, TurnOptions},
+    chat::Thinking,
     lmstudio::{ModelInfo, ModelState},
 };
 use ratatui::style::{Modifier, Style};
@@ -72,6 +79,15 @@ pub enum AppEvent {
         turn: u64,
         /// What happened.
         event: TurnEvent,
+    },
+    /// `/compact` finished. `turn` numbers it like a turn, so the result of
+    /// a cancelled one can be told apart and dropped.
+    Compacted {
+        /// Which compaction this is.
+        turn: u64,
+        /// The compacted conversation and what it saved, or the error
+        /// formatted for display.
+        result: Result<(Conversation, CompactReport), String>,
     },
     /// A line for the transcript from outside the app, e.g. a startup notice.
     Say(String),
@@ -214,9 +230,9 @@ impl PermissionOption {
 }
 
 /// Text pushed into the transcript by `/help`.
-const HELP_TEXT: &str = "commands:\n  /help             show this list\n  /model            pick and load a local model\n  /unload           unload the current model\n  /clear            clear the chat and start fresh\n  /context          tokens used and left in the model's window\n  /quit (or /exit)  exit (also Ctrl+C or Ctrl+D)\nkeys:\n  Esc               cancel the running turn\n  PageUp/PageDown/End  scroll the transcript\n  ↑/↓ + Enter       answer a permission prompt (1/2/3 also work)\ntools the model can use (inside this directory):\n  read_file, list_files         read only; never ask\n  edit_file, write_file, bash   change things; ask first\n  \"don't ask again\" for bash is per exact command";
+const HELP_TEXT: &str = "commands:\n  /help             show this list\n  /model            pick and load a local model\n  /unload           unload the current model\n  /clear            clear the chat and start fresh\n  /context          tokens used and left in the model's window\n  /compact          summarise the chat so far to free the window\n  /think [level]    how much the model thinks: off, low, medium, high, default\n  /max-tokens [n]   cap each reply at n tokens (off for no cap)\n  /quit (or /exit)  exit (also Ctrl+C or Ctrl+D)\nkeys:\n  Esc               cancel the running turn\n  Ctrl+O            show full command output (toggle)\n  PageUp/PageDown/End  scroll the transcript\n  ↑/↓ + Enter       answer a permission prompt (1/2/3 also work)\ntools the model can use (inside this directory):\n  read_file, list_files         read only; never ask\n  edit_file, write_file, bash   change things; ask first\n  \"don't ask again\" for bash is per exact command";
 
-/// Said when something must wait for the current turn.
+/// Said when something must wait for the current turn (or `/compact`).
 const BUSY_TEXT: &str = "a turn is running; wait for it or press Esc to cancel";
 
 /// Said when something must wait for `/unload` to finish.
@@ -254,12 +270,24 @@ pub struct App {
     /// What each call that asked for permission would change, by call id;
     /// kept after the answer so the transcript still shows it.
     pub tool_previews: HashMap<String, String>,
+    /// What each `bash` call that ran printed, by call id: the result the
+    /// model read, drawn dim under the call. Failed and declined calls have
+    /// none (their outcome line says why).
+    pub tool_outputs: HashMap<String, String>,
+    /// Whether command output is drawn whole rather than folded to its first
+    /// and last lines; Ctrl+O toggles it.
+    pub full_output: bool,
     /// Permission scopes the user allowed for the rest of the run
     /// ([`PermissionOption::AlwaysAllow`] in the prompt): tool names, and
     /// `bash: <command>` for single commands.
     pub always_allowed: HashSet<String>,
     /// Context window of the loaded model, in tokens, if known.
     pub context_length: Option<u64>,
+    /// How much the model may think (`/think`), from the next request on.
+    pub thinking: Thinking,
+    /// Most tokens one reply may use (`/max-tokens`), from the next request
+    /// on; `None` for no cap beyond the room left in the window.
+    pub max_output_tokens: Option<u64>,
     /// What the last request used. It carried the whole conversation, so
     /// this is how full the window is; `None` until something is sent.
     pub usage: Option<Usage>,
@@ -271,7 +299,9 @@ pub struct App {
     pub scroll_up: usize,
     /// The turn running, if any.
     turn: Option<Turn>,
-    /// Number given to the next turn.
+    /// The `/compact` running, if any. Never at the same time as a turn.
+    compaction: Option<Compaction>,
+    /// Number given to the next turn or compaction.
     next_turn: u64,
     /// The agent loop, and through it the backend for model lists and loads.
     agent: Arc<Agent>,
@@ -298,6 +328,17 @@ struct Turn {
     decisions: mpsc::Sender<Decision>,
 }
 
+/// The `/compact` currently running.
+struct Compaction {
+    /// Matches [`AppEvent::Compacted`]'s `turn`; results for other numbers are stale.
+    id: u64,
+    /// Length of the transcript when it started; harness lines said after
+    /// that (e.g. `/help`) are kept when the compacted conversation replaces it.
+    start: usize,
+    /// Stops the compaction task.
+    abort: AbortHandle,
+}
+
 impl App {
     /// Creates an app with an empty conversation, waiting for the backend to start.
     ///
@@ -320,21 +361,32 @@ impl App {
             reply_ends: HashMap::new(),
             tool_outcomes: HashMap::new(),
             tool_previews: HashMap::new(),
+            tool_outputs: HashMap::new(),
+            full_output: false,
             always_allowed: HashSet::new(),
             context_length: None,
+            thinking: Thinking::Default,
+            max_output_tokens: None,
             usage: None,
             cwd,
             scroll_up: 0,
             turn: None,
+            compaction: None,
             next_turn: 0,
             agent,
             events,
         }
     }
 
-    /// Whether a turn is running (so Esc would cancel it).
-    pub fn turn_running(&self) -> bool {
-        self.turn.is_some()
+    /// Whether a turn or `/compact` is running (so Esc would cancel it, and
+    /// nothing can be sent).
+    pub fn busy(&self) -> bool {
+        self.turn.is_some() || self.compaction.is_some()
+    }
+
+    /// Whether `/compact` is running.
+    pub fn compacting(&self) -> bool {
+        self.compaction.is_some()
     }
 
     /// The reply to draw as `thinking…`, and how long its round has run: the
@@ -355,6 +407,7 @@ impl App {
             AppEvent::Tick => self.spinner = self.spinner.wrapping_add(1),
             AppEvent::Model(event) => self.on_model(event),
             AppEvent::Turn { turn, event } => self.on_turn(turn, event),
+            AppEvent::Compacted { turn, result } => self.on_compacted(turn, result),
             AppEvent::Say(text) => self.say(text),
             // Nothing to change: the main loop redraws after every event.
             AppEvent::Resize => {}
@@ -388,9 +441,15 @@ impl App {
             .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT);
 
         match key.code {
+            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.full_output = !self.full_output;
+            }
             KeyCode::Enter if newline_modifier => self.input.insert_newline(),
             KeyCode::Enter => self.submit(),
-            KeyCode::Esc => self.cancel_turn(),
+            KeyCode::Esc => {
+                self.cancel_turn();
+                self.cancel_compaction();
+            }
             // Keys, not the wheel: capturing the mouse to scroll would take
             // away the terminal's own text selection and copy.
             KeyCode::PageUp => {
@@ -421,7 +480,13 @@ impl App {
                     .filter_map(|c| self.tool_previews.get(&c.id))
                     .map(|p| p.lines().count())
                     .sum();
-                m.content.lines().count().max(1) + 1 + m.tool_calls.len() * 2 + previews
+                let outputs: usize = m
+                    .tool_calls
+                    .iter()
+                    .filter_map(|c| self.tool_outputs.get(&c.id))
+                    .map(|o| crate::ui::output_lines(o, self.full_output).len())
+                    .sum();
+                m.content.lines().count().max(1) + 1 + m.tool_calls.len() * 2 + previews + outputs
             })
             .sum();
         drawn * 2
@@ -550,25 +615,14 @@ impl App {
     }
 
     /// Records `text` as a user message and starts a turn.
-    /// Returns false, sending nothing, if no model is ready or a turn is running.
+    /// Returns false, sending nothing, if no model is ready or a turn (or
+    /// `/compact`) is running.
     fn send(&mut self, text: &str) -> bool {
-        if self.turn.is_some() {
+        if self.busy() {
             return false;
         }
-        let model = match &self.model_status {
-            ModelStatus::Ready(id) => id.clone(),
-            ModelStatus::Loading(id) => {
-                self.say(format!("{id} is still loading"));
-                return false;
-            }
-            ModelStatus::Unloading(_) => {
-                self.say(UNLOADING_TEXT);
-                return false;
-            }
-            _ => {
-                self.say("no model loaded; use /model");
-                return false;
-            }
+        let Some(model) = self.ready_model() else {
+            return false;
         };
 
         self.conversation.push(Message::new(Role::User, text));
@@ -580,19 +634,45 @@ impl App {
         true
     }
 
+    /// The id of the model ready to be sent a request, or `None` after saying
+    /// why there is none (loading, unloading, or nothing loaded).
+    fn ready_model(&mut self) -> Option<String> {
+        match &self.model_status {
+            ModelStatus::Ready(id) => Some(id.clone()),
+            ModelStatus::Loading(id) => {
+                self.say(format!("{id} is still loading"));
+                None
+            }
+            ModelStatus::Unloading(_) => {
+                self.say(UNLOADING_TEXT);
+                None
+            }
+            _ => {
+                self.say("no model loaded; use /model");
+                None
+            }
+        }
+    }
+
     /// Runs a slash command. `command` is the text after the `/`.
     fn run_command(&mut self, command: &str) {
-        let name = command.split_whitespace().next().unwrap_or("");
+        let mut words = command.split_whitespace();
+        let name = words.next().unwrap_or("");
+        let arg = words.next();
         match name {
             "quit" | "exit" => self.should_quit = true,
             "help" => self.say(HELP_TEXT),
             // Only reads state, so it works while a turn runs.
             "context" => self.say(self.context_report()),
-            "model" | "unload" | "clear" if self.turn.is_some() => self.say(BUSY_TEXT),
+            // Settings for the next request, so they work while a turn runs.
+            "think" => self.think(arg),
+            "max-tokens" => self.max_tokens(arg),
+            "model" | "unload" | "clear" | "compact" if self.busy() => self.say(BUSY_TEXT),
             "model" if self.is_unloading() => self.say(UNLOADING_TEXT),
             "model" => self.spawn_list(),
             "unload" => self.unload(),
             "clear" => self.clear(),
+            "compact" => self.compact(),
             _ => self.say(format!("unknown command: /{name}")),
         }
     }
@@ -605,24 +685,162 @@ impl App {
         self.reply_ends.clear();
         self.tool_outcomes.clear();
         self.tool_previews.clear();
+        self.tool_outputs.clear();
         // The next request starts from an empty conversation.
         self.usage = None;
     }
 
+    /// `/compact`: starts summarising the conversation in the background (see
+    /// the module docs); the result arrives as [`AppEvent::Compacted`].
+    /// Refused while no model is ready. A conversation with nothing to
+    /// compact fails in the task, which says so.
+    fn compact(&mut self) {
+        let Some(model) = self.ready_model() else {
+            return;
+        };
+        let id = self.next_turn;
+        self.next_turn += 1;
+        let agent = Arc::clone(&self.agent);
+        let events = self.events.clone();
+        let options = self.turn_options();
+        let mut conversation = self.conversation.clone();
+        self.model_status = ModelStatus::Busy(model.clone());
+        let task = tokio::spawn(async move {
+            let result = agent
+                .compact(&model, &mut conversation, &options)
+                .await
+                .map(|report| (conversation, report))
+                .map_err(|err| format!("{err:#}"));
+            // A send error means the app has quit; nobody is left to tell.
+            let _ = events.send(AppEvent::Compacted { turn: id, result }).await;
+        });
+        self.compaction = Some(Compaction {
+            id,
+            start: self.conversation.messages().len(),
+            abort: task.abort_handle(),
+        });
+    }
+
+    /// Applies the result of `/compact`; results of any compaction but the
+    /// running one (e.g. cancelled with Esc) are dropped. On success the
+    /// compacted conversation replaces the transcript, as `/clear` would,
+    /// keeping harness lines said while it ran.
+    fn on_compacted(&mut self, id: u64, result: Result<(Conversation, CompactReport), String>) {
+        if self.compaction.as_ref().is_none_or(|c| c.id != id) {
+            return;
+        }
+        let Some(compaction) = self.end_compaction() else {
+            return;
+        };
+        let (conversation, report) = match result {
+            Ok(done) => done,
+            // The model stays loaded, so the status bar stays as it is.
+            Err(err) => {
+                self.say(format!("error: {err}"));
+                return;
+            }
+        };
+        let said: Vec<Message> = self
+            .conversation
+            .messages()
+            .iter()
+            .skip(compaction.start)
+            .filter(|m| m.role == Role::Harness)
+            .cloned()
+            .collect();
+        self.clear();
+        self.conversation = conversation;
+        self.scroll_up = 0;
+        for message in said {
+            self.conversation.push(message);
+        }
+        self.say(format!(
+            "compacted: about {} → {} tokens",
+            thousands(report.before),
+            thousands(report.after)
+        ));
+    }
+
+    /// Esc while `/compact` runs: stop it; the conversation stays as it was.
+    fn cancel_compaction(&mut self) {
+        if self.end_compaction().is_some() {
+            self.say("compaction cancelled");
+        }
+    }
+
+    /// Stops the compaction task (harmless if it already finished) and puts
+    /// the status back to `Ready`. Returns the compaction, if one was running.
+    fn end_compaction(&mut self) -> Option<Compaction> {
+        let compaction = self.compaction.take()?;
+        compaction.abort.abort();
+        if let ModelStatus::Busy(id) = &self.model_status {
+            self.model_status = ModelStatus::Ready(id.clone());
+        }
+        Some(compaction)
+    }
+
+    /// `/think`: says the thinking level, or sets it from `level`.
+    fn think(&mut self, level: Option<&str>) {
+        let Some(level) = level else {
+            self.say(format!(
+                "thinking: {} (off, low, medium, high, or default)",
+                self.thinking
+            ));
+            return;
+        };
+        match Thinking::parse(level) {
+            Some(thinking) => {
+                self.thinking = thinking;
+                self.say(format!("thinking: {thinking}"));
+            }
+            None => self.say(format!("unknown thinking level: {level}")),
+        }
+    }
+
+    /// `/max-tokens`: says the reply cap, or sets it from `value` (`off`
+    /// clears it).
+    fn max_tokens(&mut self, value: Option<&str>) {
+        match value {
+            None => {}
+            Some(off) if off.eq_ignore_ascii_case("off") => self.max_output_tokens = None,
+            Some(n) => match n.parse::<u64>() {
+                Ok(n) if n > 0 => self.max_output_tokens = Some(n),
+                _ => {
+                    self.say(format!(
+                        "not a reply cap: {n} (give a whole number above 0, or off)"
+                    ));
+                    return;
+                }
+            },
+        }
+        self.say(self.reply_cap());
+    }
+
+    /// `reply cap: none` or `reply cap: 2,048 tokens`.
+    fn reply_cap(&self) -> String {
+        match self.max_output_tokens {
+            Some(n) => format!("reply cap: {} tokens", thousands(n)),
+            None => "reply cap: none".to_owned(),
+        }
+    }
+
     /// `/context`: how much of the model's window the conversation fills, from
-    /// the last request's usage and the loaded model's context length.
+    /// the last request's usage and the loaded model's context length, then
+    /// the limits the next request goes out with.
     fn context_report(&self) -> String {
+        let settings = format!("thinking: {}, {}", self.thinking, self.reply_cap());
         let Some(model) = self.loaded_model() else {
-            return "context: no model loaded".to_owned();
+            return format!("context: no model loaded\n{settings}");
         };
         let Some(usage) = self.usage else {
-            return match self.context_length {
+            let first = match self.context_length {
                 Some(window) => format!(
                     "context: nothing sent yet; the window is {} tokens ({model})",
                     thousands(window)
                 ),
                 None => format!("context: nothing sent yet; the window size is unknown ({model})"),
             };
+            return format!("{first}\n{settings}");
         };
         let used = usage.prompt_tokens + usage.completion_tokens;
         let first = match self.context_length {
@@ -646,7 +864,7 @@ impl App {
             ),
         };
         format!(
-            "{first}\nlast request: {} prompt + {} reply ({model})",
+            "{first}\nlast request: {} prompt + {} reply ({model})\n{settings}",
             thousands(usage.prompt_tokens),
             thousands(usage.completion_tokens)
         )
@@ -692,7 +910,7 @@ impl App {
                 self.model_status = ModelStatus::NoModel;
             }
             // Asked for before the turn started; loading now would pull the model away.
-            ModelEvent::ModelsListed(_) if self.turn.is_some() => self.say(BUSY_TEXT),
+            ModelEvent::ModelsListed(_) if self.busy() => self.say(BUSY_TEXT),
             // Asked for before `/unload`; a load now would race it.
             ModelEvent::ModelsListed(_) if self.is_unloading() => self.say(UNLOADING_TEXT),
             ModelEvent::ModelsListed(models) if models.is_empty() => {
@@ -746,6 +964,13 @@ impl App {
 
     /// Shows one agent event in the transcript while the turn runs.
     fn mirror(&mut self, event: AgentEvent) {
+        if let AgentEvent::ReplyCutOff { attempt, max } = event {
+            // The reply keeps its text; the continuation is appended to it.
+            self.say(format!(
+                "reply cut off at the output limit; asking the model to continue ({attempt}/{max})"
+            ));
+            return;
+        }
         let Some(turn) = self.turn.as_mut() else {
             return;
         };
@@ -799,10 +1024,16 @@ impl App {
             }
             AgentEvent::ToolFinished {
                 id,
+                name,
                 summary,
                 is_error,
-                ..
+                output,
             } => {
+                // An error's summary already says what went wrong, and a
+                // declined call's output is only the refusal the model reads.
+                if name == "bash" && !is_error {
+                    self.tool_outputs.insert(id.clone(), output);
+                }
                 let outcome = ToolOutcome { summary, is_error };
                 self.tool_outcomes.insert(id, outcome);
                 turn.round_started = Instant::now();
@@ -816,6 +1047,8 @@ impl App {
                     completion_tokens,
                 });
             }
+            // Said above, before the reply is borrowed.
+            AgentEvent::ReplyCutOff { .. } => {}
             // `Finished` follows, carrying the conversation.
             AgentEvent::TurnDone => {}
             AgentEvent::TurnFailed(err) => self.say(format!("error: {err}")),
@@ -944,6 +1177,7 @@ impl App {
         let agent = Arc::clone(&self.agent);
         let events = self.events.clone();
         let (decisions, answers) = mpsc::channel(4);
+        let options = self.turn_options();
         let task = tokio::spawn(async move {
             let send = |event| events.send(AppEvent::Turn { turn: id, event });
             let (sink, mut progress) = mpsc::channel(64);
@@ -958,7 +1192,7 @@ impl App {
             let mut conversation = history;
             // `run_turn` owns `sink` and drops it when it returns, which ends
             // `forward`. Its error was already sent as `TurnFailed`.
-            let turn = agent.run_turn(&model, &mut conversation, sink, answers);
+            let turn = agent.run_turn(&model, &mut conversation, sink, answers, &options);
             let (_, ()) = tokio::join!(turn, forward);
             let _ = send(TurnEvent::Finished(conversation)).await;
         });
@@ -970,6 +1204,16 @@ impl App {
             abort: task.abort_handle(),
             decisions,
         });
+    }
+
+    /// The limits the next request goes out with: the loaded model's window
+    /// and the `/think` and `/max-tokens` settings.
+    fn turn_options(&self) -> TurnOptions {
+        TurnOptions {
+            context_length: self.context_length,
+            max_output_tokens: self.max_output_tokens,
+            thinking: self.thinking,
+        }
     }
 
     /// Runs `task` in the background and sends its result into the main loop.
@@ -1008,7 +1252,7 @@ pub mod testing {
     use anyhow::{Result, anyhow};
     use loops_core::{
         backend::{BoxFuture, ModelBackend},
-        chat::ChatDelta,
+        chat::{ChatDelta, RequestOptions},
         tools::{ToolSet, ToolSpec},
     };
 
@@ -1044,6 +1288,8 @@ pub mod testing {
         pub fail: Option<&'static str>,
         /// Messages passed to `chat`, one entry per call.
         pub chats: Mutex<Vec<Vec<Message>>>,
+        /// Options passed to `chat`, one entry per call.
+        pub options: Mutex<Vec<RequestOptions>>,
     }
 
     impl ModelBackend for FakeBackend {
@@ -1070,11 +1316,13 @@ pub mod testing {
             _model: &'a str,
             messages: &'a [Message],
             _tools: &'a [ToolSpec],
+            options: &'a RequestOptions,
             sink: mpsc::Sender<ChatDelta>,
         ) -> BoxFuture<'a, Result<()>> {
             let mut chats = self.chats.lock().unwrap();
             let round = self.script.get(chats.len()).cloned().unwrap_or_default();
             chats.push(messages.to_vec());
+            self.options.lock().unwrap().push(options.clone());
             Box::pin(async move {
                 for delta in round {
                     if sink.send(delta).await.is_err() {
@@ -1225,7 +1473,7 @@ mod tests {
         model, plain_app, test_app, type_line,
     };
     use super::*;
-    use loops_core::chat::ChatDelta;
+    use loops_core::chat::{ChatDelta, RequestOptions};
 
     fn key(code: KeyCode) -> AppEvent {
         AppEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
@@ -1542,6 +1790,49 @@ mod tests {
         assert_eq!(app.conversation.messages().len(), 2);
     }
 
+    /// Only a `bash` call that ran keeps its output for the transcript: a
+    /// file tool's result is not shown, nor is a failed or declined command's.
+    #[tokio::test]
+    async fn only_a_bash_call_that_ran_keeps_its_output() {
+        let (mut app, _backend, _rx) = chat_app(Vec::new());
+        type_line(&mut app, "hi");
+        let finish =
+            |id: &str, name: &str, is_error: bool, output: &str| AgentEvent::ToolFinished {
+                id: id.into(),
+                name: name.into(),
+                summary: "s".into(),
+                is_error,
+                output: output.into(),
+            };
+        for event in [
+            finish("c1", "bash", false, "exit code: 0\nhi"),
+            finish("c2", "read_file", false, "1: # loops"),
+            finish("c3", "bash", true, "error: command is empty"),
+            finish("c4", "bash", true, "declined by the user"),
+        ] {
+            app.update(agent_event(&app, event));
+        }
+        assert_eq!(
+            app.tool_outputs,
+            HashMap::from([("c1".to_owned(), "exit code: 0\nhi".to_owned())])
+        );
+        assert_eq!(app.tool_outcomes.len(), 4);
+    }
+
+    /// Ctrl+O toggles between folded and full command output, and types
+    /// nothing into the input box.
+    #[test]
+    fn ctrl_o_toggles_full_output() {
+        let mut app = plain_app();
+        let ctrl_o = || AppEvent::Key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        assert!(!app.full_output);
+        app.update(ctrl_o());
+        assert!(app.full_output);
+        assert_eq!(app.input.lines(), [""]);
+        app.update(ctrl_o());
+        assert!(!app.full_output);
+    }
+
     #[tokio::test]
     async fn esc_after_a_tool_round_keeps_text_without_tool_calls() {
         let (mut app, _backend, _rx) = chat_app(Vec::new());
@@ -1556,6 +1847,7 @@ mod tests {
             name: "list_files".into(),
             summary: "3 entries".into(),
             is_error: false,
+            output: "a\nb\nc".into(),
         };
         for event in [started, finished, AgentEvent::Thinking, text("par")] {
             app.update(agent_event(&app, event));
@@ -1592,6 +1884,8 @@ mod tests {
             },
         );
         app.tool_previews.insert("c1".into(), "edit a.txt".into());
+        app.tool_outputs
+            .insert("c2".into(), "exit code: 0\nhi".into());
         app.always_allowed.insert("edit_file".into());
 
         type_line(&mut app, "/clear");
@@ -1599,6 +1893,7 @@ mod tests {
         assert!(app.reply_ends.is_empty());
         assert!(app.tool_outcomes.is_empty());
         assert!(app.tool_previews.is_empty());
+        assert!(app.tool_outputs.is_empty());
         assert_eq!(app.model_status, ModelStatus::Ready(READY_MODEL.into()));
         assert!(app.always_allowed.contains("edit_file"));
 
@@ -1754,6 +2049,19 @@ mod tests {
             msgs[0]
                 .content
                 .contains("/context          tokens used and left in the model's window")
+        );
+        assert!(
+            msgs[0]
+                .content
+                .contains("/compact          summarise the chat so far to free the window")
+        );
+        assert!(msgs[0].content.contains(
+            "/think [level]    how much the model thinks: off, low, medium, high, default"
+        ));
+        assert!(
+            msgs[0]
+                .content
+                .contains("/max-tokens [n]   cap each reply at n tokens (off for no cap)")
         );
         assert!(msgs[0].content.contains("read_file, list_files"));
         assert!(
@@ -1991,6 +2299,7 @@ mod tests {
             name: "list_files".into(),
             summary: "3 entries".into(),
             is_error: false,
+            output: "a\nb\nc".into(),
         }
     }
 
@@ -2389,7 +2698,10 @@ mod tests {
     fn context_without_a_model_says_so() {
         let mut app = plain_app();
         app.model_status = ModelStatus::NoModel;
-        assert_eq!(context_says(&mut app), "context: no model loaded");
+        assert_eq!(
+            context_says(&mut app),
+            "context: no model loaded\nthinking: default, reply cap: none"
+        );
     }
 
     #[test]
@@ -2397,7 +2709,8 @@ mod tests {
         let mut app = context_app(Some(8192), None);
         assert_eq!(
             context_says(&mut app),
-            "context: nothing sent yet; the window is 8,192 tokens (google/gemma-4-e4b)"
+            "context: nothing sent yet; the window is 8,192 tokens (google/gemma-4-e4b)\n\
+             thinking: default, reply cap: none"
         );
     }
 
@@ -2407,7 +2720,8 @@ mod tests {
         assert_eq!(
             context_says(&mut app),
             "context: 1,532 of 8,192 tokens used (19%), 6,660 left\n\
-             last request: 1,401 prompt + 131 reply (google/gemma-4-e4b)"
+             last request: 1,401 prompt + 131 reply (google/gemma-4-e4b)\n\
+             thinking: default, reply cap: none"
         );
     }
 
@@ -2417,17 +2731,21 @@ mod tests {
         assert_eq!(
             context_says(&mut app),
             "context: 9,000 of 8,192 tokens used (over the window by 808)\n\
-             last request: 8,000 prompt + 1,000 reply (google/gemma-4-e4b)"
+             last request: 8,000 prompt + 1,000 reply (google/gemma-4-e4b)\n\
+             thinking: default, reply cap: none"
         );
     }
 
     #[test]
     fn context_with_an_unknown_window_gives_what_was_used() {
         let mut app = context_app(None, Some((1401, 131)));
+        app.thinking = Thinking::Off;
+        app.max_output_tokens = Some(2048);
         assert_eq!(
             context_says(&mut app),
             "context: 1,532 tokens used of an unknown window\n\
-             last request: 1,401 prompt + 131 reply (google/gemma-4-e4b)"
+             last request: 1,401 prompt + 131 reply (google/gemma-4-e4b)\n\
+             thinking: off, reply cap: 2,048 tokens"
         );
     }
 
@@ -2439,8 +2757,292 @@ mod tests {
         let said = context_says(&mut app);
         assert_eq!(
             said,
-            "context: nothing sent yet; the window is 8,192 tokens (google/gemma-4-e4b)"
+            "context: nothing sent yet; the window is 8,192 tokens (google/gemma-4-e4b)\n\
+             thinking: default, reply cap: none"
         );
         assert!(app.turn.is_some());
+    }
+
+    /// What the app said last.
+    fn last_said(app: &App) -> &str {
+        let last = app.conversation.messages().last().unwrap();
+        assert_eq!(last.role, Role::Harness);
+        &last.content
+    }
+
+    #[test]
+    fn think_says_and_sets_the_level() {
+        let mut app = plain_app();
+        type_line(&mut app, "/think");
+        assert_eq!(
+            last_said(&app),
+            "thinking: default (off, low, medium, high, or default)"
+        );
+        type_line(&mut app, "/think OFF");
+        assert_eq!(app.thinking, Thinking::Off);
+        assert_eq!(last_said(&app), "thinking: off");
+        type_line(&mut app, "/think lots");
+        assert_eq!(last_said(&app), "unknown thinking level: lots");
+        assert_eq!(app.thinking, Thinking::Off, "unchanged");
+        type_line(&mut app, "/think");
+        assert_eq!(
+            last_said(&app),
+            "thinking: off (off, low, medium, high, or default)"
+        );
+    }
+
+    #[test]
+    fn max_tokens_says_sets_and_clears_the_cap() {
+        let mut app = plain_app();
+        type_line(&mut app, "/max-tokens");
+        assert_eq!(last_said(&app), "reply cap: none");
+        type_line(&mut app, "/max-tokens 4096");
+        assert_eq!(app.max_output_tokens, Some(4096));
+        assert_eq!(last_said(&app), "reply cap: 4,096 tokens");
+        for bad in ["0", "-5", "lots"] {
+            type_line(&mut app, &format!("/max-tokens {bad}"));
+            assert_eq!(
+                last_said(&app),
+                format!("not a reply cap: {bad} (give a whole number above 0, or off)")
+            );
+        }
+        assert_eq!(app.max_output_tokens, Some(4096), "unchanged");
+        type_line(&mut app, "/max-tokens off");
+        assert_eq!(app.max_output_tokens, None);
+        assert_eq!(last_said(&app), "reply cap: none");
+    }
+
+    /// Both settings work while a turn runs and go out with the next request,
+    /// together with the loaded model's window.
+    #[tokio::test]
+    async fn settings_change_during_a_turn_and_reach_the_next_request() {
+        let (mut app, backend, mut rx) = chat_app(vec![vec![content("one")], vec![content("two")]]);
+        app.context_length = Some(8192);
+        type_line(&mut app, "first");
+        type_line(&mut app, "/think low");
+        type_line(&mut app, "/max-tokens 100");
+        assert_eq!(app.thinking, Thinking::Low, "set while the turn runs");
+        run_to_end(&mut app, &mut rx).await;
+        type_line(&mut app, "second");
+        run_to_end(&mut app, &mut rx).await;
+
+        let options = backend.options.lock().unwrap();
+        assert_eq!(options.len(), 2);
+        assert_eq!(options[0].thinking, Thinking::Default);
+        assert!(
+            options[0].max_tokens.is_some_and(|n| n > 100 && n < 8192),
+            "the room left in the window: {:?}",
+            options[0].max_tokens
+        );
+        assert_eq!(
+            options[1],
+            RequestOptions {
+                max_tokens: Some(100),
+                thinking: Thinking::Low,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cut_off_reply_is_mirrored_as_a_harness_line() {
+        let (mut app, _backend, _rx) = chat_app(Vec::new());
+        type_line(&mut app, "hi");
+        app.update(agent_event(&app, text("Hello, ")));
+        let cut_off = AgentEvent::ReplyCutOff { attempt: 1, max: 2 };
+        app.update(agent_event(&app, cut_off));
+        app.update(agent_event(&app, text("world.")));
+
+        let msgs = app.conversation.messages();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(
+            msgs[1],
+            Message::new(Role::Assistant, "Hello, world."),
+            "the continuation lands in the same reply"
+        );
+        assert_eq!(
+            msgs[2],
+            Message::new(
+                Role::Harness,
+                "reply cut off at the output limit; asking the model to continue (1/2)"
+            )
+        );
+    }
+
+    /// Applies channel events until `/compact` ends.
+    async fn compact_to_end(app: &mut App, rx: &mut mpsc::Receiver<AppEvent>) {
+        while app.compaction.is_some() {
+            app.update(rx.recv().await.unwrap());
+        }
+    }
+
+    /// A chat of one exchange the server counted as 6,200 tokens.
+    fn chatted(app: &mut App) {
+        app.conversation.push(Message::new(Role::User, "hi"));
+        app.conversation
+            .push(Message::new(Role::Assistant, "hello"));
+        app.conversation.set_token_mark(2, 6200);
+    }
+
+    #[tokio::test]
+    async fn compact_replaces_the_conversation_with_the_summary() {
+        let (mut app, backend, mut rx) = chat_app(vec![vec![content("Greeted.")]]);
+        chatted(&mut app);
+        app.reply_ends.insert(1, ReplyEnd::Empty);
+        app.tool_previews.insert("c1".into(), "edit a.txt".into());
+        app.tool_outputs
+            .insert("c2".into(), "exit code: 0\nhi".into());
+        app.usage = Some(Usage {
+            prompt_tokens: 6000,
+            completion_tokens: 200,
+        });
+        type_line(&mut app, "/compact");
+        assert!(app.compacting());
+        assert_eq!(app.model_status, ModelStatus::Busy(READY_MODEL.into()));
+        // Said while it runs, so kept.
+        type_line(&mut app, "/think");
+        compact_to_end(&mut app, &mut rx).await;
+
+        let mut compacted = Conversation::new();
+        compacted.push(Message::new(
+            Role::User,
+            "Summary of the conversation so far, written to continue after \
+             earlier messages were removed:\n\nGreeted.",
+        ));
+        compacted.push(Message::new(
+            Role::Assistant,
+            "Understood. Continuing from that summary.",
+        ));
+        let after = compacted.estimated_tokens(0);
+        let msgs = app.conversation.messages();
+        assert_eq!(msgs[..2], *compacted.messages());
+        assert_eq!(
+            msgs[2].content,
+            "thinking: default (off, low, medium, high, or default)"
+        );
+        assert_eq!(
+            msgs[3],
+            Message::new(
+                Role::Harness,
+                format!("compacted: about 6,200 → {after} tokens")
+            )
+        );
+        assert_eq!(msgs.len(), 4);
+        assert!(app.reply_ends.is_empty());
+        assert!(app.tool_previews.is_empty());
+        assert!(app.tool_outputs.is_empty());
+        assert_eq!(app.usage, None);
+        assert_eq!(app.model_status, ModelStatus::Ready(READY_MODEL.into()));
+        assert!(!app.compacting());
+        assert_eq!(backend.options.lock().unwrap()[0].thinking, Thinking::Off);
+
+        // The next message goes out with the summary, not the old chat.
+        type_line(&mut app, "go on");
+        tokio::task::yield_now().await;
+        let chats = backend.chats.lock().unwrap();
+        assert_eq!(chats[1][..2], *compacted.messages());
+    }
+
+    #[tokio::test]
+    async fn compact_is_refused_while_busy() {
+        let (mut app, backend, _rx) = chat_app(Vec::new());
+        type_line(&mut app, "first");
+        type_line(&mut app, "/compact");
+        assert_eq!(last_said(&app), BUSY_TEXT);
+        assert!(!app.compacting());
+
+        app.update(key(KeyCode::Esc));
+        type_line(&mut app, "/compact");
+        assert!(app.compacting());
+        for command in ["/compact", "/clear", "/model"] {
+            type_line(&mut app, command);
+            assert_eq!(last_said(&app), BUSY_TEXT);
+        }
+        type_line(&mut app, "second");
+        assert_eq!(
+            app.input.lines(),
+            ["second"],
+            "the message stays in the box"
+        );
+        tokio::task::yield_now().await;
+        // The turn was cancelled before it sent anything.
+        assert_eq!(backend.chats.lock().unwrap().len(), 1, "the summary only");
+    }
+
+    #[tokio::test]
+    async fn compact_without_a_ready_model_says_so() {
+        let (mut app, backend, mut rx) = test_app(Vec::new());
+        app.model_status = ModelStatus::NoModel;
+        type_line(&mut app, "/compact");
+        assert_eq!(last_said(&app), "no model loaded; use /model");
+        app.model_status = ModelStatus::Loading(READY_MODEL.into());
+        type_line(&mut app, "/compact");
+        assert_eq!(last_said(&app), format!("{READY_MODEL} is still loading"));
+        assert!(!app.compacting());
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_err(), "nothing was spawned");
+        assert!(backend.chats.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn compact_errors_are_said_and_change_nothing() {
+        let (mut app, _backend, mut rx) = chat_app(Vec::new());
+        type_line(&mut app, "/compact");
+        compact_to_end(&mut app, &mut rx).await;
+        assert_eq!(last_said(&app), "error: nothing to compact");
+        assert_eq!(app.model_status, ModelStatus::Ready(READY_MODEL.into()));
+
+        let (mut app, _backend, mut rx) = failing_app(Vec::new(), "boom");
+        chatted(&mut app);
+        let old = app.conversation.messages().to_vec();
+        type_line(&mut app, "/compact");
+        compact_to_end(&mut app, &mut rx).await;
+        assert_eq!(app.conversation.messages()[..2], old[..]);
+        assert_eq!(last_said(&app), "error: boom");
+        assert_eq!(app.model_status, ModelStatus::Ready(READY_MODEL.into()));
+    }
+
+    #[tokio::test]
+    async fn esc_cancels_compaction_and_keeps_the_conversation() {
+        let (mut app, _backend, _rx) = chat_app(vec![vec![content("Greeted.")]]);
+        chatted(&mut app);
+        let old = app.conversation.messages().to_vec();
+        type_line(&mut app, "/compact");
+        app.update(key(KeyCode::Esc));
+
+        assert!(!app.compacting());
+        assert_eq!(app.model_status, ModelStatus::Ready(READY_MODEL.into()));
+        assert_eq!(app.conversation.messages()[..2], old[..]);
+        assert_eq!(last_said(&app), "compaction cancelled");
+        assert_eq!(app.conversation.token_mark(), Some((2, 6200)));
+    }
+
+    #[tokio::test]
+    async fn a_result_from_a_stale_compaction_is_ignored() {
+        let (mut app, _backend, _rx) = chat_app(Vec::new());
+        chatted(&mut app);
+        type_line(&mut app, "/compact");
+        let old = app.compaction.as_ref().unwrap().id;
+        app.update(key(KeyCode::Esc));
+        let before = app.conversation.messages().to_vec();
+        let stale = || {
+            let report = CompactReport {
+                before: 6200,
+                after: 10,
+                summary: "late".into(),
+            };
+            AppEvent::Compacted {
+                turn: old,
+                result: Ok((Conversation::new(), report)),
+            }
+        };
+
+        // With nothing running, and with a newer compaction running.
+        app.update(stale());
+        assert_eq!(app.conversation.messages(), before);
+        type_line(&mut app, "/compact");
+        assert_ne!(app.compaction.as_ref().unwrap().id, old);
+        app.update(stale());
+        assert_eq!(app.conversation.messages(), before);
+        assert!(app.compacting(), "the newer one goes on");
     }
 }

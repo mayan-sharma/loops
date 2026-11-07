@@ -300,10 +300,80 @@ pub fn to_openai_tools(tools: &[ToolSpec]) -> Value {
         .collect()
 }
 
+/// How much the model may think, sent as the request's `reasoning_effort`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Thinking {
+    /// Whatever the model does unasked; no `reasoning_effort` is sent.
+    #[default]
+    Default,
+    /// No thinking at all (`reasoning_effort: "none"`).
+    Off,
+    /// A little thinking.
+    Low,
+    /// A moderate amount of thinking.
+    Medium,
+    /// As much thinking as the model likes.
+    High,
+}
+
+impl Thinking {
+    /// Reads a level as typed by a user: `default` (or `on`), `off` (or
+    /// `none`), `low`, `medium`, `high`, in any case. `None` for anything else.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.to_ascii_lowercase().as_str() {
+            "default" | "on" => Some(Self::Default),
+            "off" | "none" => Some(Self::Off),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            _ => None,
+        }
+    }
+
+    /// The request's `reasoning_effort` value, or `None` to leave it out.
+    pub fn reasoning_effort(self) -> Option<&'static str> {
+        match self {
+            Self::Default => None,
+            Self::Off => Some("none"),
+            Self::Low => Some("low"),
+            Self::Medium => Some("medium"),
+            Self::High => Some("high"),
+        }
+    }
+}
+
+impl std::fmt::Display for Thinking {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Default => "default",
+            Self::Off => "off",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        })
+    }
+}
+
+/// Per-request limits on what the model may produce.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RequestOptions {
+    /// Most tokens the reply may use, thinking included (`max_tokens`); `None`
+    /// leaves it to the server.
+    pub max_tokens: Option<u64>,
+    /// How much the model may think (`reasoning_effort`).
+    pub thinking: Thinking,
+}
+
 /// A streaming chat request body. `tools` and `tool_choice` are only included
-/// when there are tools to offer. Usage is always asked for, so the stream
-/// ends with the token counts ([`ChatDelta::Usage`]).
-pub fn request_body(model: &str, messages: &[Message], tools: &[ToolSpec]) -> Value {
+/// when there are tools to offer, `max_tokens` and `reasoning_effort` only when
+/// `options` sets them. Usage is always asked for, so the stream ends with the
+/// token counts ([`ChatDelta::Usage`]).
+pub fn request_body(
+    model: &str,
+    messages: &[Message],
+    tools: &[ToolSpec],
+    options: &RequestOptions,
+) -> Value {
     let mut body = json!({
         "model": model,
         "messages": to_openai_messages(messages),
@@ -313,6 +383,12 @@ pub fn request_body(model: &str, messages: &[Message], tools: &[ToolSpec]) -> Va
     if !tools.is_empty() {
         body["tools"] = to_openai_tools(tools);
         body["tool_choice"] = json!("auto");
+    }
+    if let Some(max_tokens) = options.max_tokens {
+        body["max_tokens"] = json!(max_tokens);
+    }
+    if let Some(effort) = options.thinking.reasoning_effort() {
+        body["reasoning_effort"] = json!(effort);
     }
     body
 }
@@ -563,7 +639,7 @@ mod tests {
     #[test]
     fn tools_are_only_offered_when_there_are_some() {
         let messages = [Message::new(Role::User, "hi")];
-        let plain = request_body("m", &messages, &[]);
+        let plain = request_body("m", &messages, &[], &RequestOptions::default());
         assert_eq!(plain.get("tools"), None);
         assert_eq!(plain.get("tool_choice"), None);
         assert_eq!(plain["stream"], true);
@@ -574,7 +650,7 @@ mod tests {
             description: "Read a file".into(),
             parameters: json!({ "type": "object" }),
         };
-        let body = request_body("m", &messages, &[spec]);
+        let body = request_body("m", &messages, &[spec], &RequestOptions::default());
         assert_eq!(body["tool_choice"], "auto");
         assert_eq!(
             body["tools"],
@@ -586,6 +662,60 @@ mod tests {
                     "parameters": { "type": "object" },
                 },
             }])
+        );
+    }
+
+    #[test]
+    fn limits_are_sent_only_when_set() {
+        let messages = [Message::new(Role::User, "hi")];
+        let plain = request_body("m", &messages, &[], &RequestOptions::default());
+        assert_eq!(plain.get("max_tokens"), None);
+        assert_eq!(plain.get("reasoning_effort"), None);
+
+        let options = RequestOptions {
+            max_tokens: Some(512),
+            thinking: Thinking::Off,
+        };
+        let body = request_body("m", &messages, &[], &options);
+        assert_eq!(body["max_tokens"], 512);
+        assert_eq!(body["reasoning_effort"], "none");
+    }
+
+    #[test]
+    fn thinking_levels_parse_and_print() {
+        for (text, level) in [
+            ("default", Thinking::Default),
+            ("ON", Thinking::Default),
+            ("off", Thinking::Off),
+            ("None", Thinking::Off),
+            ("low", Thinking::Low),
+            ("Medium", Thinking::Medium),
+            ("HIGH", Thinking::High),
+        ] {
+            assert_eq!(Thinking::parse(text), Some(level), "{text}");
+        }
+        assert_eq!(Thinking::parse("max"), None);
+        assert_eq!(Thinking::parse(""), None);
+
+        let shown: Vec<String> = [
+            Thinking::Default,
+            Thinking::Off,
+            Thinking::Low,
+            Thinking::Medium,
+            Thinking::High,
+        ]
+        .iter()
+        .map(|level| format!("{level}: {:?}", level.reasoning_effort()))
+        .collect();
+        assert_eq!(
+            shown,
+            [
+                "default: None",
+                "off: Some(\"none\")",
+                "low: Some(\"low\")",
+                "medium: Some(\"medium\")",
+                "high: Some(\"high\")",
+            ]
         );
     }
 }

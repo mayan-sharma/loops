@@ -9,7 +9,12 @@ use std::{future::Future, pin::Pin};
 use anyhow::Result;
 use tokio::sync::mpsc;
 
-use crate::{Message, chat::ChatDelta, lmstudio::ModelInfo, tools::ToolSpec};
+use crate::{
+    Message,
+    chat::{ChatDelta, RequestOptions},
+    lmstudio::ModelInfo,
+    tools::ToolSpec,
+};
 
 /// A boxed, sendable future. Trait methods return this so the trait stays
 /// object-safe (`async fn` in a trait cannot be called through `dyn`).
@@ -30,14 +35,16 @@ pub trait ModelBackend: Send + Sync {
     /// Unloads `id` and resolves once the backend no longer reports it loaded.
     fn unload_model<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<()>>;
 
-    /// Sends `messages` to `model`, offering it `tools` (none if empty), and
-    /// streams the reply into `sink` as it is generated. Resolves once the
-    /// stream ends. To cancel, drop the future (e.g. abort the task running it).
+    /// Sends `messages` to `model`, offering it `tools` (none if empty) under
+    /// the limits in `options`, and streams the reply into `sink` as it is
+    /// generated. Resolves once the stream ends. To cancel, drop the future
+    /// (e.g. abort the task running it).
     fn chat<'a>(
         &'a self,
         model: &'a str,
         messages: &'a [Message],
         tools: &'a [ToolSpec],
+        options: &'a RequestOptions,
         sink: mpsc::Sender<ChatDelta>,
     ) -> BoxFuture<'a, Result<()>>;
 }
