@@ -6,6 +6,7 @@ record pass/fail plus what the harness reported (rounds, tool calls, tokens,
 wall time). Results go to results/<stamp>.json and results/<stamp>.md.
 
 Usage: python run.py [--runs N] [--tasks a,b] [--harness loops,pi] [--timeout S]
+       [--model google/gemma-4-e4b]
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ RESULTS = HERE / "results"
 VENV_BIN = HERE / ".venv" / "Scripts"
 PYTHON = VENV_BIN / "python.exe"
 LOOPS = HERE.parent / "target" / "release" / "loops.exe"
-PI_MODEL = ("lmstudio", "gemma-4-e4b")
+MODEL = "google/gemma-4-e4b"  # LM Studio id; pi gets the part after the slash
 # npm installs a `pi.cmd` shim on Windows; CreateProcess does not resolve bare `pi`.
 PI = shutil.which("pi.cmd") or shutil.which("pi") or "pi"
 
@@ -81,9 +82,10 @@ def kill_tree(proc: subprocess.Popen) -> None:
 def run_process(cmd: list[str], cwd: Path, timeout: int, env: dict) -> dict:
     """Runs cmd, capturing stdout/stderr; kills the tree on timeout."""
     started = time.monotonic()
-    proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True, encoding="utf-8",
-                            errors="replace", env=env)
+    # No stdin: pi -p waits for EOF on an inherited pipe and never starts.
+    proc = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, encoding="utf-8", errors="replace", env=env)
     try:
         out, err = proc.communicate(timeout=timeout)
         timed_out = False
@@ -100,7 +102,7 @@ def run_process(cmd: list[str], cwd: Path, timeout: int, env: dict) -> dict:
 def run_loops(cwd: Path, prompt: str, timeout: int) -> dict:
     stats_path = cwd / ".loops-stats.json"
     cmd = [str(LOOPS), "--print", prompt, "--stats", str(stats_path),
-           "--timeout", str(timeout), "--max-rounds", "40"]
+           "--timeout", str(timeout), "--max-rounds", "40", "--model", MODEL]
     res = run_process(cmd, cwd, timeout + 30, env_with_venv())
     stats = {}
     if stats_path.exists():
@@ -123,8 +125,8 @@ def run_loops(cwd: Path, prompt: str, timeout: int) -> dict:
 
 
 def run_pi(cwd: Path, prompt: str, timeout: int) -> dict:
-    provider, model = PI_MODEL
-    cmd = [PI, "-p", "--mode", "json", "--provider", provider, "--model", model,
+    cmd = [PI, "-p", "--mode", "json", "--provider", "lmstudio",
+           "--model", MODEL.split("/")[-1],
            "--no-session", "--no-extensions", "--no-skills", "--no-context-files",
            "--no-mcp", prompt]
     res = run_process(cmd, cwd, timeout, env_with_venv())
@@ -188,12 +190,15 @@ def prepare(task: Path, harness: str, run: int) -> Path:
 
 
 def main() -> int:
+    global MODEL
     ap = argparse.ArgumentParser()
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--tasks", default="")
     ap.add_argument("--harness", default="loops,pi")
     ap.add_argument("--timeout", type=int, default=300)
+    ap.add_argument("--model", default=MODEL)
     args = ap.parse_args()
+    MODEL = args.model
 
     tasks = sorted(p for p in TASKS.iterdir() if p.is_dir())
     if args.tasks:
@@ -213,7 +218,8 @@ def main() -> int:
                 print(f"{task.name:22} {harness:6} run {run} ...", end=" ", flush=True)
                 r = HARNESSES[harness](work, prompt, args.timeout)
                 tests = run_pytest(work)
-                r.update(task=task.name, harness=harness, run=run, tests=tests)
+                r.update(task=task.name, harness=harness, run=run, tests=tests,
+                         model=MODEL)
                 results.append(r)
                 print(f"{'PASS' if tests['ok'] else 'fail':4} {r['outcome']:7} "
                       f"{r['elapsed_s']:6.1f}s rounds={r['rounds']:2} "
