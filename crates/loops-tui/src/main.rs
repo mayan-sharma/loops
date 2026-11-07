@@ -8,7 +8,7 @@
 //!  terminal ──EventStream──> [reader task] ──mpsc──┐
 //!  LM Studio ─────> [model tasks, agent turn] ──mpsc──┤
 //!                                                  ├─> select! ─> App::update ─> ui::draw
-//!  250ms interval ────────────────────── Tick ─────┘
+//!  100ms interval ────────────────────── Tick ─────┘
 //! ```
 //!
 //! Every input source is a task that sends [`AppEvent`]s into the channel. The
@@ -23,6 +23,7 @@
 
 mod app;
 mod print;
+mod torus;
 mod ui;
 
 use std::{process::ExitCode, sync::Arc, time::Duration};
@@ -44,7 +45,7 @@ use tokio::time::MissedTickBehavior;
 use app::{App, AppEvent, ModelEvent, describe_instructions};
 
 /// How often [`AppEvent::Tick`] fires.
-const TICK: Duration = Duration::from_millis(250);
+const TICK: Duration = Duration::from_millis(100);
 
 #[tokio::main]
 async fn main() -> Result<ExitCode> {

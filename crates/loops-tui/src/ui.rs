@@ -23,7 +23,10 @@ use ratatui::{
 };
 use serde_json::Value;
 
-use crate::app::{App, Mode, ModelStatus, PermissionOption, ReplyEnd, ToolOutcome, Usage};
+use crate::{
+    app::{App, Mode, ModelStatus, PermissionOption, ReplyEnd, ToolOutcome, Usage},
+    torus,
+};
 
 /// Braille spinner frames, advanced by `AppEvent::Tick`.
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -53,6 +56,17 @@ const PERMISSION_HEIGHT: u16 = PermissionOption::ALL.len() as u16 + 2;
 
 /// Height of the banner: two lines and the border.
 const BANNER_HEIGHT: u16 = 4;
+
+/// The splash needs this much room under the banner (and the harness lines
+/// there), or the transcript draws as usual.
+const SPLASH_MIN_WIDTH: u16 = 24;
+const SPLASH_MIN_HEIGHT: u16 = 10;
+
+/// Widest the splash torus is drawn.
+const SPLASH_MAX_WIDTH: u16 = 90;
+
+/// The dim line under the splash torus.
+const SPLASH_HINT: &str = "/model to pick a model · type a message to begin";
 
 /// Lines of command output kept from each end while it is folded (see
 /// [`fold_output`]).
@@ -238,8 +252,9 @@ fn shows_banner(app: &App) -> bool {
         .any(|m| matches!(m.role, Role::User | Role::Assistant))
 }
 
-/// The banner (while the chat is new), then the message history, wrapped and
-/// pinned to the bottom unless scrolled up.
+/// The banner (while the chat is new) over the splash, if there is room for
+/// it; otherwise the message history, wrapped and pinned to the bottom unless
+/// scrolled up.
 fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) {
     let mut area = area;
     if shows_banner(app) {
@@ -251,6 +266,9 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) {
         ])
         .areas(area);
         draw_banner(frame, banner, app);
+        if draw_splash(frame, rest, app) {
+            return;
+        }
         area = rest;
     }
     if area.height == 0 {
@@ -301,6 +319,84 @@ fn draw_banner(frame: &mut Frame, area: Rect, app: &App) {
         .border_style(Style::new().dim())
         .padding(Padding::new(2, 1, 0, 0));
     frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// The splash under the banner of a new chat: any harness lines at the top,
+/// then a spinning torus (turned by `app.torus_angle`) and a dim hint,
+/// centered in the room left. Returns false, drawing nothing, when there is
+/// not room for it, so the transcript draws as usual.
+fn draw_splash(frame: &mut Frame, area: Rect, app: &App) -> bool {
+    if area.width < SPLASH_MIN_WIDTH || area.height < SPLASH_MIN_HEIGHT {
+        return false;
+    }
+    let notes = Paragraph::new(transcript_lines(app)).wrap(Wrap { trim: false });
+    let used = u16::try_from(notes.line_count(area.width)).unwrap_or(u16::MAX);
+    let [notes_area, rest] =
+        Layout::vertical([Constraint::Length(used), Constraint::Fill(1)]).areas(area);
+    if rest.height < SPLASH_MIN_HEIGHT {
+        return false;
+    }
+    frame.render_widget(notes, notes_area);
+
+    // Twice as wide as tall looks round in terminal cells.
+    let width = rest
+        .width
+        .min(rest.height.saturating_mul(2))
+        .min(SPLASH_MAX_WIDTH);
+    let height = (rest.height - 2).min(width / 2);
+    let hint = rest.width >= u16::try_from(SPLASH_HINT.chars().count()).unwrap_or(u16::MAX);
+    let block = height + u16::from(hint);
+    // Round the top margin up, so a spare row parts it from the lines above.
+    let top = rest.y + (rest.height - block).div_ceil(2);
+    let torus_area = Rect {
+        x: rest.x + (rest.width - width) / 2,
+        y: top,
+        width,
+        height,
+    };
+    let (a, b) = app.torus_angle;
+    frame.render_widget(
+        Paragraph::new(torus_lines(torus::frame(a, b, width, height))),
+        torus_area,
+    );
+    if hint {
+        let hint_row = Rect {
+            y: top + height,
+            height: 1,
+            ..rest
+        };
+        frame.render_widget(Line::from(SPLASH_HINT.dim()).centered(), hint_row);
+    }
+    true
+}
+
+/// Torus rows in cyan, the darkest four shades dim so it has depth.
+fn torus_lines(rows: Vec<String>) -> Vec<Line<'static>> {
+    let bright = Style::new().cyan();
+    let dark = bright.dim();
+    rows.into_iter()
+        .map(|row| {
+            let mut spans = Vec::new();
+            let mut run = String::new();
+            let mut run_style = Style::new();
+            for c in row.chars() {
+                let style = if c == ' ' {
+                    Style::new()
+                } else if torus::SHADES[..4].contains(c) {
+                    dark
+                } else {
+                    bright
+                };
+                if style != run_style && !run.is_empty() {
+                    spans.push(Span::styled(std::mem::take(&mut run), run_style));
+                }
+                run_style = style;
+                run.push(c);
+            }
+            spans.push(Span::styled(run, run_style));
+            Line::from(spans)
+        })
+        .collect()
 }
 
 /// Every drawn message, oldest first, with a blank line between messages.
@@ -894,6 +990,138 @@ mod tests {
         );
         assert_eq!(screen[1].trim(), "");
         assert!(screen[2].starts_with("❯ hi"));
+    }
+
+    // --- splash -------------------------------------------------------------
+
+    /// The rows above the input box, where the transcript draws.
+    fn transcript_rows(buffer: &Buffer) -> Vec<String> {
+        let mut screen = rows(buffer);
+        screen.truncate(screen.len() - usize::from(INPUT_HEIGHT) - 1);
+        screen
+    }
+
+    fn has_torus(rows: &[String]) -> bool {
+        rows.iter().any(|row| row.contains(['@', '$', '#']))
+    }
+
+    #[test]
+    fn a_new_chat_spins_a_torus_under_the_banner() {
+        let mut app = plain_app();
+        let buffer = render_buffer(&app, 80, 30);
+        let screen = transcript_rows(&buffer);
+        assert!(screen[1].contains("loops  v0.1.0"));
+        assert!(!has_torus(&screen[..5]), "nothing over the banner's gap");
+        assert!(has_torus(&screen[5..]));
+        let (x, y) = find(&screen, SPLASH_HINT);
+        assert_eq!(
+            usize::from(x),
+            (80 - SPLASH_HINT.chars().count()) / 2,
+            "centered"
+        );
+        assert!(is_dim(&buffer[(x, y)]));
+        assert!(
+            !has_torus(&screen[usize::from(y)..]),
+            "the hint is under the torus"
+        );
+
+        // The first cell of each shade under the banner.
+        let shade = |c: char| {
+            let (x, y) = find(&screen[5..], &c.to_string());
+            &buffer[(x, y + 5)]
+        };
+        assert_eq!(shade('@').fg, Color::Cyan);
+        assert!(!is_dim(shade('@')));
+        assert_eq!(shade('.').fg, Color::Cyan);
+        assert!(is_dim(shade('.')));
+
+        app.update(crate::app::AppEvent::Tick);
+        assert_ne!(
+            transcript_rows(&render_buffer(&app, 80, 30)),
+            screen,
+            "it turns"
+        );
+    }
+
+    #[test]
+    fn harness_lines_stay_above_the_torus() {
+        let mut app = plain_app();
+        app.conversation.push(Message::new(
+            Role::Harness,
+            "bash not found; the bash tool is off",
+        ));
+        let screen = transcript_rows(&render_buffer(&app, 80, 30));
+        assert!(
+            screen[5].starts_with("loops › bash not found"),
+            "{}",
+            screen[5]
+        );
+        assert!(has_torus(&screen[6..]));
+        assert!(
+            screen
+                .join(
+                    "
+"
+                )
+                .contains(SPLASH_HINT)
+        );
+    }
+
+    #[test]
+    fn the_torus_goes_with_the_first_message() {
+        let mut app = plain_app();
+        app.conversation.push(Message::new(Role::User, "hi"));
+        let screen = transcript_rows(&render_buffer(&app, 80, 30));
+        assert!(!has_torus(&screen));
+        assert!(
+            !screen
+                .join(
+                    "
+"
+                )
+                .contains(SPLASH_HINT)
+        );
+        assert!(screen.iter().any(|row| row.starts_with("❯ hi")));
+    }
+
+    #[test]
+    fn no_torus_without_room_and_no_panic_at_any_size() {
+        let app = plain_app();
+        let screen = transcript_rows(&render_buffer(&app, 40, 12));
+        assert!(!has_torus(&screen));
+        assert!(
+            !screen
+                .join(
+                    "
+"
+                )
+                .contains(SPLASH_HINT)
+        );
+        for width in [1, 10, 23, 24, 25, 40, 49, 60, 100, 200] {
+            for height in [1, 5, 18, 19, 20, 25, 50, 80] {
+                render_buffer(&app, width, height);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn clear_brings_the_torus_back() {
+        let (mut app, _backend, _rx) = chat_app(Vec::new());
+        app.conversation.push(Message::new(Role::User, "hi"));
+        app.conversation
+            .push(Message::new(Role::Assistant, "hello"));
+        assert!(!has_torus(&transcript_rows(&render_buffer(&app, 80, 30))));
+        type_line(&mut app, "/clear");
+        let screen = transcript_rows(&render_buffer(&app, 80, 30));
+        assert!(has_torus(&screen));
+        assert!(
+            screen
+                .join(
+                    "
+"
+                )
+                .contains(SPLASH_HINT)
+        );
     }
 
     // --- messages -----------------------------------------------------------

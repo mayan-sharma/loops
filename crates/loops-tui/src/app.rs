@@ -51,6 +51,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    f32::consts::TAU,
     future::Future,
     path::PathBuf,
     sync::Arc,
@@ -82,7 +83,7 @@ pub enum AppEvent {
     Key(KeyEvent),
     /// The terminal was resized; the next draw picks up the new size.
     Resize,
-    /// Periodic timer; advances the loading spinner.
+    /// Periodic timer; advances the spinners and turns the splash torus.
     Tick,
     /// A model backend task finished.
     Model(ModelEvent),
@@ -286,6 +287,9 @@ pub struct App {
     pub mode: Mode,
     /// Advanced on every tick; picks the spinner frame while loading.
     pub spinner: usize,
+    /// How far the splash torus has turned about its two axes, in radians;
+    /// advanced on every tick (see [`crate::torus`]).
+    pub torus_angle: (f32, f32),
     /// Set when the user asks to exit; the main loop stops on the next turn.
     pub should_quit: bool,
     /// Endings to draw after a reply, keyed by its index in `conversation`.
@@ -403,6 +407,7 @@ impl App {
             model_status: ModelStatus::Starting,
             mode: Mode::Normal,
             spinner: 0,
+            torus_angle: (0.0, 0.0),
             should_quit: false,
             reply_ends: HashMap::new(),
             tool_outcomes: HashMap::new(),
@@ -463,7 +468,12 @@ impl App {
     pub fn update(&mut self, event: AppEvent) {
         match event {
             AppEvent::Key(key) => self.on_key(key),
-            AppEvent::Tick => self.spinner = self.spinner.wrapping_add(1),
+            AppEvent::Tick => {
+                self.spinner = self.spinner.wrapping_add(1);
+                // Kept within one turn so the angles never lose precision.
+                let (a, b) = self.torus_angle;
+                self.torus_angle = ((a + 0.07) % TAU, (b + 0.03) % TAU);
+            }
             AppEvent::Model(event) => self.on_model(event),
             AppEvent::Turn { turn, event } => self.on_turn(turn, event),
             AppEvent::Compacted { turn, result } => self.on_compacted(turn, result),
@@ -2436,11 +2446,16 @@ mod tests {
     }
 
     #[test]
-    fn tick_advances_the_spinner() {
+    fn tick_advances_the_spinner_and_turns_the_torus() {
         let mut app = plain_app();
         app.update(AppEvent::Tick);
         app.update(AppEvent::Tick);
         assert_eq!(app.spinner, 2);
+        let (a, b) = app.torus_angle;
+        assert!(
+            (a - 0.14).abs() < 1e-6 && (b - 0.06).abs() < 1e-6,
+            "{a} {b}"
+        );
     }
 
     /// Confirming the model that is already loaded reports it instead of loading a second copy.
